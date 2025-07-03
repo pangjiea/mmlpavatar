@@ -74,6 +74,10 @@ class GaussianModel:
         self.joint_parents = torch.empty(0)
 
         self.all_poses = torch.empty(0)
+        
+        # facial parameters
+        self.expression = torch.zeros(10, dtype=torch.float32)
+        self.jaw_pose = torch.zeros(3, dtype=torch.float32)
 
         # cache
         self.cache_dict = {}
@@ -292,9 +296,16 @@ class GaussianModel:
             std = self.pca_std
             lowdim_pose_conds = torch.maximum(lowdim_pose_conds, -sigma_pca * std)
             lowdim_pose_conds = torch.minimum(lowdim_pose_conds, sigma_pca * std)
-            features = self.pca.inverse_transform(lowdim_pose_conds).reshape(-1)
+            body_features = self.pca.inverse_transform(lowdim_pose_conds).reshape(-1)
         else:
-            features = self.smpl_poses_cuda[3:3*22]
+            body_features = self.smpl_poses_cuda[3:3*22]  # 63维 body poses
+
+        # 拼接表情和下颌参数
+        expression_cuda = self.expression.cuda()  # 10维
+        jaw_pose_cuda = self.jaw_pose.cuda()      # 3维
+        
+        # 组合成76维特征: body(63) + expression(10) + jaw(3)
+        features = torch.cat([body_features, expression_cuda, jaw_pose_cuda])
 
         return features
 
@@ -473,10 +484,10 @@ class GaussianModel:
         for key in ['grid', 'bbox_min', 'bbox_max', 'grid_dims']: ginfo[key] = torch.as_tensor(ginfo[key]).detach().cuda()
         self.weights_grid_info = ginfo
 
-        # Pose encoder
-        models = [MLP(layers_size_list=[63, 512, 256, 256, 256, self.num_basis+self.num_vt_basis]) for i in range(len(xyz_ft))]
+        # Pose encoder - 扩展输入维度支持表情: body(63) + expression(10) + jaw(3) = 76
+        models = [MLP(layers_size_list=[76, 512, 256, 256, 256, self.num_basis+self.num_vt_basis]) for i in range(len(xyz_ft))]
         params, _ = stack_module_state(models)
-        self.encoder_feat_model_meta = MLP(layers_size_list=[63, 512, 256, 256, 256, self.num_basis+self.num_vt_basis]).to('meta')
+        self.encoder_feat_model_meta = MLP(layers_size_list=[76, 512, 256, 256, 256, self.num_basis+self.num_vt_basis]).to('meta')
         for k, v in params.items():
             params[k] = nn.Parameter(v.cuda().requires_grad_(True))
         self.encoder_feat_params = params

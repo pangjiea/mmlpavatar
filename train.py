@@ -66,6 +66,8 @@ def training(args: Config):
 
         gaussians.smpl_poses = cam['pose']
         gaussians.Th, gaussians.Rh = cam['Th'], cam['Rh']
+        gaussians.expression = cam.get('expression', torch.zeros(10, dtype=torch.float32))
+        gaussians.jaw_pose = cam.get('jaw_pose', torch.zeros(3, dtype=torch.float32))
 
         image, alpha, info = gaussians.render(cam, background=bg)
         image = torch.clamp(image, 0, 1)
@@ -158,6 +160,8 @@ def training_report(scene: Scene, gaussians: GaussianModel, iteration, test_iter
             cam = data_to_cam(cam, non_blocking=False)
             gaussians.smpl_poses = cam['pose']
             gaussians.Th, gaussians.Rh = cam['Th'], cam['Rh']
+            gaussians.expression = cam.get('expression', torch.zeros(10, dtype=torch.float32))
+            gaussians.jaw_pose = cam.get('jaw_pose', torch.zeros(3, dtype=torch.float32))
 
             image, alpha, info = gaussians.render(cam, background=background)
             image = torch.clamp(image, 0, 1)

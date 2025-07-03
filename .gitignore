@@ -1,4 +1,20 @@
+# Large model files
+*.npz
+*.pkl
+*.pth
+*.ckpt
+
+# Output directories  
+output/
+logs/
+checkpoints/
+results/
+
+# SMPL model files
+smpl_model/
+
+# System files
+.DS_Store
 *.pyc
-.vscode
 __pycache__
 tmp

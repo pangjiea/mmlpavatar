@@ -1,4 +1,3 @@
-
 import os
 import sys
 import numpy as np
@@ -19,7 +18,7 @@ def data_to_cam(data: dict, non_blocking=True):
     img_list = ['image', 'mask', 'mask_boundary']
     tensor_list = ['K', 'w2c']
     const_list = ['height', 'width', 'frame_id', 'cam_id', 'idx']
-    cpu_list = ['pose', 'beta', 'Rh', 'Th']
+    cpu_list = ['pose', 'beta', 'Rh', 'Th', 'expression', 'jaw_pose']
     global stm
     if stm is None: stm = torch.cuda.Stream()
     for k, v in data.items():
@@ -139,6 +138,8 @@ class AVRexDataset:
         beta = smpl_params['betas'][0]
 
         pose_list, Th_list, Rh_list = [], [], []
+        expression_list, jaw_pose_list = [], []
+        
         for frame_id in range(N_frame):
             pose = np.concatenate([smpl_params['global_orient'][frame_id],
                         smpl_params['body_pose'][frame_id],
@@ -149,12 +150,31 @@ class AVRexDataset:
             Th = smpl_params['transl'][frame_id]
             Rh = np.eye(3, dtype=np.float32)
 
+            # 加载expression和jaw_pose (如果存在)
+            if 'expression' in smpl_params:
+                expression = smpl_params['expression'][frame_id]
+            else:
+                expression = np.zeros(10, dtype=np.float32)
+                
+            if 'jaw_pose' in smpl_params:
+                jaw_pose = smpl_params['jaw_pose'][frame_id]
+            else:
+                jaw_pose = np.zeros(3, dtype=np.float32)
+
             pose_list.append(pose)
             Th_list.append(Th)
             Rh_list.append(Rh)
+            expression_list.append(expression)
+            jaw_pose_list.append(jaw_pose)
 
-        pose_data = dict(pose=np.array(pose_list).astype(np.float32), Th=np.array(Th_list).astype(np.float32),
-                         Rh=np.array(Rh_list).astype(np.float32), beta=beta.astype(np.float32))
+        pose_data = dict(
+            pose=np.array(pose_list).astype(np.float32), 
+            Th=np.array(Th_list).astype(np.float32),
+            Rh=np.array(Rh_list).astype(np.float32), 
+            beta=beta.astype(np.float32),
+            expression=np.array(expression_list).astype(np.float32),
+            jaw_pose=np.array(jaw_pose_list).astype(np.float32)
+        )
         return pose_data
 
     @staticmethod
@@ -180,6 +200,7 @@ class AVRexDataset:
 
         pose, Rh, Th, beta = self.smpl_params['pose'][frame_id], self.smpl_params['Rh'][frame_id], \
             self.smpl_params['Th'][frame_id], self.smpl_params['beta']
+        expression, jaw_pose = self.smpl_params['expression'][frame_id], self.smpl_params['jaw_pose'][frame_id]
 
         # Load camera
         K, D, w2c = self.annots[cam_id]['K'], self.annots[cam_id]['D'], self.annots[cam_id]['w2c']
@@ -211,6 +232,8 @@ class AVRexDataset:
             'Rh': torch.from_numpy(Rh).float(),
             'Th': torch.from_numpy(Th).float(),
             'beta': torch.from_numpy(beta).float(),
+            'expression': torch.from_numpy(expression).float(),
+            'jaw_pose': torch.from_numpy(jaw_pose).float(),
             'height': image.shape[0],
             'width': image.shape[1],
             'frame_id': frame_id,
@@ -277,6 +300,7 @@ class ThumanDataset:
 
         pose, Rh, Th, beta = self.smpl_params['pose'][frame_id], self.smpl_params['Rh'][frame_id], \
             self.smpl_params['Th'][frame_id], self.smpl_params['beta']
+        expression, jaw_pose = self.smpl_params['expression'][frame_id], self.smpl_params['jaw_pose'][frame_id]
 
         # Load camera
         K, D, w2c = self.annots[cam_id]['K'], self.annots[cam_id]['D'], self.annots[cam_id]['w2c']
@@ -308,6 +332,8 @@ class ThumanDataset:
             'Rh': torch.from_numpy(Rh).float(),
             'Th': torch.from_numpy(Th).float(),
             'beta': torch.from_numpy(beta).float(),
+            'expression': torch.from_numpy(expression).float(),
+            'jaw_pose': torch.from_numpy(jaw_pose).float(),
             'height': image.shape[0],
             'width': image.shape[1],
             'frame_id': frame_id,
@@ -449,6 +475,8 @@ class ActorsHQDataset:
             'Rh': torch.from_numpy(Rh).float(),
             'Th': torch.from_numpy(Th).float(),
             'beta': torch.from_numpy(beta).float(),
+            'expression': torch.from_numpy(expression).float(),
+            'jaw_pose': torch.from_numpy(jaw_pose).float(),
             'height': image.shape[0],
             'width': image.shape[1],
             'frame_id': frame_id,
