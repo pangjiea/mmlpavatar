@@ -33,7 +33,8 @@ def data_to_cam(data: dict, non_blocking=True):
         elif k in img_list:
             with torch.cuda.stream(stm):
                 data[k] = torch.as_tensor(v).squeeze().cuda(non_blocking=non_blocking)
-            return data
+    
+    return data
 
 def get_dataset_type(datadir):
     # 检查SQ格式数据集
@@ -224,8 +225,13 @@ class AVRexDataset:
 
             image = image.astype(np.float32) / 255
             mask = mask[:,:,0] > 128 if len(mask.shape) == 3 else mask > 128
-            # Ensure mask is 2D by squeezing any extra dimensions
-            mask = np.squeeze(mask)
+            # Ensure mask is exactly 2D by explicitly reshaping
+            if len(mask.shape) > 2:
+                mask = mask.reshape(mask.shape[-2], mask.shape[-1])
+            elif len(mask.shape) == 1:
+                # If somehow flattened, try to infer shape from image
+                h, w = image.shape[:2]
+                mask = mask.reshape(h, w)
             
             mask_boundary = get_mask_boundary(mask, 5)
         else:
@@ -426,8 +432,6 @@ class ThumanDataset:
 
             image = image.astype(np.float32) / 255
             mask = mask[:,:,0] > 128 if len(mask.shape) == 3 else mask > 128
-            # Ensure mask is 2D by squeezing any extra dimensions
-            mask = np.squeeze(mask)
             
             mask_boundary = get_mask_boundary(mask, 3)
         else:
@@ -435,11 +439,17 @@ class ThumanDataset:
             mask = np.zeros((100, 100), dtype=bool)
             mask_boundary = mask
 
+        # Final validation: ensure mask is exactly 2D before creating tensor
+        if len(mask.shape) != 2:
+            mask = mask.reshape(image.shape[0], image.shape[1])
+        
+        mask_tensor = torch.from_numpy(mask)
+
         data = {
             'K': torch.from_numpy(K).float(),
             'w2c': torch.from_numpy(w2c).float(),
             'image': torch.from_numpy(image).float(),
-            'mask': torch.from_numpy(mask), 
+            'mask': mask_tensor, 
             'mask_boundary': torch.from_numpy(mask_boundary),
             'pose': torch.from_numpy(pose).float(),
             'Rh': torch.from_numpy(Rh).float(),
@@ -572,8 +582,13 @@ class ActorsHQDataset:
 
             image = image.astype(np.float32) / 255
             mask = mask[:,:,0] > 128 if len(mask.shape) == 3 else mask > 128
-            # Ensure mask is 2D by squeezing any extra dimensions
-            mask = np.squeeze(mask)
+            # Ensure mask is exactly 2D by explicitly reshaping
+            if len(mask.shape) > 2:
+                mask = mask.reshape(mask.shape[-2], mask.shape[-1])
+            elif len(mask.shape) == 1:
+                # If somehow flattened, try to infer shape from image
+                h, w = image.shape[:2]
+                mask = mask.reshape(h, w)
             
             mask_boundary = get_mask_boundary(mask, 4)
         else:
