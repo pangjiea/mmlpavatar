@@ -92,7 +92,8 @@ class Scene:
         os.makedirs(path.join(args.data_dir, 'gaussian'), exist_ok=True)
         weights_grid_path = path.join(args.data_dir, 'gaussian/lbs_weights_grid.npz')
         if not path.exists(weights_grid_path):
-            raise FileExistsError
+            raise FileNotFoundError(f"权重网格文件不存在: {weights_grid_path}\n"
+                                   f"请先运行: python script/gen_weight_volume.py --data_dir {args.data_dir} 来生成权重文件")
         grid_info = dict(np.load(weights_grid_path, allow_pickle=True))
 
         # initialize gaussian model

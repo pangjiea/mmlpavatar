@@ -12,7 +12,10 @@ results/
 
 # SMPL model files
 smpl_model/
-
+bins/
+#point_interpolant/
+PoissonRecon/
+template/
 # System files
 .DS_Store
 *.pyc

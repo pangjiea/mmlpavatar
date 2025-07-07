@@ -33,9 +33,14 @@ def data_to_cam(data: dict, non_blocking=True):
         elif k in img_list:
             with torch.cuda.stream(stm):
                 data[k] = torch.as_tensor(v).squeeze().cuda(non_blocking=non_blocking)
-    return data
+            return data
 
 def get_dataset_type(datadir):
+    # 检查SQ格式数据集
+    # if path.exists(path.join(datadir, 'calibration.json')) and \
+    #    path.exists(path.join(datadir, 'smplx_fitting')) and \
+    #    path.exists(path.join(datadir, 'mattings')):
+    #     return SQDataset
     if path.exists(path.join(datadir, 'calibration.json')):
         return ThumanDataset
     if path.exists(path.join(datadir, 'calibration_full.json')):
@@ -64,7 +69,7 @@ def resize_image(image, mask, K, image_scaling=1):
 
     H, W = int(image.shape[0] * image_scaling), int(image.shape[1] * image_scaling)
     image = cv.resize(image, (W, H), interpolation=cv.INTER_AREA)
-    msk = cv.resize(msk, (W, H), interpolation=cv.INTER_NEAREST)
+    mask = cv.resize(mask, (W, H), interpolation=cv.INTER_NEAREST)
     K = np.copy(K)
     K[:2] = K[:2] * image_scaling
 
@@ -136,6 +141,10 @@ class AVRexDataset:
 
         N_frame = len(smpl_params['global_orient'])
         beta = smpl_params['betas'][0]
+        
+        # 如果是SMPL-X格式（300维），截取前10维用于SMPL
+        if len(beta) > 10:
+            beta = beta[:10]
 
         pose_list, Th_list, Rh_list = [], [], []
         expression_list, jaw_pose_list = [], []
@@ -215,6 +224,8 @@ class AVRexDataset:
 
             image = image.astype(np.float32) / 255
             mask = mask[:,:,0] > 128 if len(mask.shape) == 3 else mask > 128
+            # Ensure mask is 2D by squeezing any extra dimensions
+            mask = np.squeeze(mask)
             
             mask_boundary = get_mask_boundary(mask, 5)
         else:
@@ -248,13 +259,25 @@ class ThumanDataset:
                 split = 'train', image_scaling=1, is_in_memory=False):
         
         indices = []
-        annots = AVRexDataset.load_cams_data(datadir, cam_file_name='calibration.json')
+        annots = ThumanDataset.load_cams_data(datadir, cam_file_name='calibration.json')
+        
+        # 自动检测文件格式（6位数字 vs 8位数字）
+        self.use_6d_format = ThumanDataset.detect_file_format(datadir, frame_ids, annots)
         
         for frame_id in frame_ids:
             for cam_id in cam_ids:
-                cam_name, img_name = annots[cam_id]['name'], f'{frame_id:08d}.jpg'
+                cam_name = annots[cam_id]['name']
+                if self.use_6d_format:
+                    # SQ格式：6位数字
+                    img_name = f'{frame_id:06d}.jpg'
+                    mask_name = f'{frame_id:06d}.png'
+                else:
+                    # 原始THuman格式：8位数字
+                    img_name = f'{frame_id:08d}.jpg'
+                    mask_name = f'{frame_id:08d}.png'
+                
                 if path.exists(path.join(datadir, f'images/{cam_name}/{img_name}')) and \
-                        path.exists(path.join(datadir, f'masks/{cam_name}/{img_name}')): 
+                        path.exists(path.join(datadir, f'masks/{cam_name}/{mask_name}')): 
                     indices.append( (frame_id, cam_id) )
 
         self.indices = indices
@@ -279,14 +302,102 @@ class ThumanDataset:
         self.smpl_params = AVRexDataset.load_pose_data(datadir)
 
     @staticmethod
-    def get_scene_scale(datadir):
-        return AVRexDataset.get_scene_scale(datadir, cam_file_name='calibration.json')
+    def load_cams_data(datadir, cam_file_name='calibration.json'):
+        with open(path.join(datadir, cam_file_name), 'r') as file:
+            data = json.load(file)
+
+        cams = []
+        
+        # 检查是否是SQ格式的嵌套结构
+        if 'cameras' in data and 'camera_poses' in data:
+            # SQ格式：有cameras和camera_poses两个部分
+            cameras_info = data['cameras']
+            poses_info = data['camera_poses']
+            
+            for cam_id_str, cam_data in cameras_info.items():
+                cam = {}
+                cam['name'] = cam_id_str
+                
+                # 从cameras部分获取内参
+                cam['K'] = np.array(cam_data['K']).astype(np.float32).reshape(3,3)
+                cam['D'] = np.array(cam_data.get('dist', [0,0,0,0,0])).astype(np.float32)
+                
+                # 从camera_poses部分获取外参
+                if cam_id_str in poses_info:
+                    pose_data = poses_info[cam_id_str]
+                    cam['R'] = np.array(pose_data['R']).astype(np.float32).reshape(3,3)
+                    cam['T'] = np.array(pose_data['T']).astype(np.float32).reshape(3)
+                else:
+                    # 如果没有找到对应的pose，使用默认值
+                    cam['R'] = np.eye(3, dtype=np.float32)
+                    cam['T'] = np.zeros(3, dtype=np.float32)
+                
+                T, R = cam['T'], cam['R']
+                w2c = np.eye(4, dtype=np.float32)
+                w2c[:3, :3] = R
+                w2c[:3, 3] = T
+                cam['w2c'] = w2c
+                cams.append(cam)
+        else:
+            # 原始THuman格式：直接在根级别
+            for k, v in data.items():
+                cam = {}
+                cam['name'] = k
+                cam['K'] = np.array(v['K']).astype(np.float32).reshape(3,3)
+                cam['R'] = np.array(v['R']).astype(np.float32).reshape(3,3)
+                cam['T'] = np.array(v['T']).astype(np.float32).reshape(3)
+                cam['D'] = np.array(v.get('distCoeff', [0,0,0,0,0])).astype(np.float32)
+                T, R = cam['T'], cam['R']
+                w2c = np.block([[R, T.reshape(3,1)], [np.array([[0,0,0,1]])]])
+                cam['w2c'] = w2c
+                cams.append(cam)
+        
+        return cams
 
     @staticmethod
-    def load_image_mask(datadir, cam_name, frame_id):
-        image_path = path.join(datadir, f'images/{cam_name}/{frame_id:08d}.jpg')
+    def detect_file_format(datadir, frame_ids, annots):
+        """检测数据集使用6位数字还是8位数字格式"""
+        if not frame_ids or not annots:
+            return True  # 默认使用6位格式
+        
+        # 取第一个帧和第一个相机进行检测
+        test_frame = frame_ids[0]
+        test_cam = annots[0]['name']
+        
+        # 检查6位数字格式
+        img_6d = f'{test_frame:06d}.jpg'
+        mask_6d = f'{test_frame:06d}.png'
+        if path.exists(path.join(datadir, f'images/{test_cam}/{img_6d}')) and \
+           path.exists(path.join(datadir, f'masks/{test_cam}/{mask_6d}')):
+            return True
+        
+        # 检查8位数字格式
+        img_8d = f'{test_frame:08d}.jpg'
+        mask_8d = f'{test_frame:08d}.png'
+        if path.exists(path.join(datadir, f'images/{test_cam}/{img_8d}')) and \
+           path.exists(path.join(datadir, f'masks/{test_cam}/{mask_8d}')):
+            return False
+        
+        # 默认返回6位格式
+        return True
+
+    @staticmethod
+    def get_scene_scale(datadir):
+        cams = ThumanDataset.load_cams_data(datadir, cam_file_name='calibration.json')
+        return get_scene_scale(cams)
+
+    @staticmethod
+    def load_image_mask(datadir, cam_name, frame_id, use_6d_format=True):
+        if use_6d_format:
+            # SQ格式：6位数字
+            image_path = path.join(datadir, f'images/{cam_name}/{frame_id:06d}.jpg')
+            mask_path = path.join(datadir, f'masks/{cam_name}/{frame_id:06d}.png')
+        else:
+            # 原始THuman格式：8位数字
+            image_path = path.join(datadir, f'images/{cam_name}/{frame_id:08d}.jpg')
+            mask_path = path.join(datadir, f'masks/{cam_name}/{frame_id:08d}.png')
+        
         image = iio.imread(image_path)[...,:3]
-        mask_path = path.join(datadir, f'masks/{cam_name}/{frame_id:08d}.jpg')
         mask = iio.imread(mask_path)   # 1C u8
         return image, mask
 
@@ -309,12 +420,14 @@ class ThumanDataset:
         # avatarrex camera: W2C  down y 
 
         if self.is_load_image:
-            image, mask = ThumanDataset.load_image_mask(self.datadir, cam_name, frame_id)
+            image, mask = ThumanDataset.load_image_mask(self.datadir, cam_name, frame_id, self.use_6d_format)
             image, mask = apply_distortion([image, mask], K, D)
             image, mask, K = resize_image(image, mask, K, self.image_scaling)
 
             image = image.astype(np.float32) / 255
             mask = mask[:,:,0] > 128 if len(mask.shape) == 3 else mask > 128
+            # Ensure mask is 2D by squeezing any extra dimensions
+            mask = np.squeeze(mask)
             
             mask_boundary = get_mask_boundary(mask, 3)
         else:
@@ -446,6 +559,7 @@ class ActorsHQDataset:
 
         pose, Rh, Th, beta = self.smpl_params['pose'][frame_id], self.smpl_params['Rh'][frame_id], \
             self.smpl_params['Th'][frame_id], self.smpl_params['beta']
+        expression, jaw_pose = self.smpl_params['expression'][frame_id], self.smpl_params['jaw_pose'][frame_id]
 
         # Load camera
         K, D, w2c = self.annots[cam_id]['K'], self.annots[cam_id]['D'], self.annots[cam_id]['w2c']
@@ -458,6 +572,8 @@ class ActorsHQDataset:
 
             image = image.astype(np.float32) / 255
             mask = mask[:,:,0] > 128 if len(mask.shape) == 3 else mask > 128
+            # Ensure mask is 2D by squeezing any extra dimensions
+            mask = np.squeeze(mask)
             
             mask_boundary = get_mask_boundary(mask, 4)
         else:

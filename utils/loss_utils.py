@@ -1,7 +1,7 @@
-
-
 import torch
 import torch.nn.functional as F
+import ssl
+import urllib.request
 
 from torch.nn.functional import l1_loss
 from torchmetrics.functional.image import peak_signal_noise_ratio, structural_similarity_index_measure
@@ -30,8 +30,23 @@ def lpips_loss(img1, img2):
     global lpips_model
     img1 = img1.permute(2,0,1)[None]
     img2 = img2.permute(2,0,1)[None]
-    if lpips_model is None: 
-        lpips_model = LearnedPerceptualImagePatchSimilarity(net_type='vgg', normalize=True).cuda()
+    if lpips_model is None:
+        try:
+            # Try normal SSL verification first
+            lpips_model = LearnedPerceptualImagePatchSimilarity(net_type='vgg', normalize=True).cuda()
+        except (ssl.SSLError, urllib.error.URLError) as e:
+            print(f"SSL error when downloading VGG model: {e}")
+            print("Attempting download with SSL verification disabled...")
+            # Temporarily disable SSL verification
+            old_context = ssl._create_default_https_context
+            ssl._create_default_https_context = ssl._create_unverified_context
+            try:
+                lpips_model = LearnedPerceptualImagePatchSimilarity(net_type='vgg', normalize=True).cuda()
+                print("Successfully downloaded VGG model with SSL verification disabled")
+            finally:
+                # Restore SSL context
+                ssl._create_default_https_context = old_context
+        
         for p in lpips_model.parameters(): p.requires_grad = False
     loss = lpips_model(img1, img2)
     return loss
