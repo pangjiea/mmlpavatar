@@ -1,3 +1,4 @@
+
 import os
 import sys
 import numpy as np
@@ -18,7 +19,7 @@ def data_to_cam(data: dict, non_blocking=True):
     img_list = ['image', 'mask', 'mask_boundary']
     tensor_list = ['K', 'w2c']
     const_list = ['height', 'width', 'frame_id', 'cam_id', 'idx']
-    cpu_list = ['pose', 'beta', 'Rh', 'Th', 'expression', 'jaw_pose']
+    cpu_list = ['pose', 'beta', 'Rh', 'Th']
     global stm
     if stm is None: stm = torch.cuda.Stream()
     for k, v in data.items():
@@ -33,19 +34,14 @@ def data_to_cam(data: dict, non_blocking=True):
         elif k in img_list:
             with torch.cuda.stream(stm):
                 data[k] = torch.as_tensor(v).squeeze().cuda(non_blocking=non_blocking)
-    
     return data
 
 def get_dataset_type(datadir):
-    # 检查SQ格式数据集
-    # if path.exists(path.join(datadir, 'calibration.json')) and \
-    #    path.exists(path.join(datadir, 'smplx_fitting')) and \
-    #    path.exists(path.join(datadir, 'mattings')):
-    #     return SQDataset
-    if path.exists(path.join(datadir, 'calibration.json')):
-        return ThumanDataset
+
     if path.exists(path.join(datadir, 'calibration_full.json')):
         return AVRexDataset
+    if path.exists(path.join(datadir, 'calibration.json')):
+        return ThumanDataset
     if path.exists(path.join(datadir, 'calibration.csv')):
         return ActorsHQDataset
     raise RuntimeError
@@ -70,7 +66,7 @@ def resize_image(image, mask, K, image_scaling=1):
 
     H, W = int(image.shape[0] * image_scaling), int(image.shape[1] * image_scaling)
     image = cv.resize(image, (W, H), interpolation=cv.INTER_AREA)
-    mask = cv.resize(mask, (W, H), interpolation=cv.INTER_NEAREST)
+    msk = cv.resize(msk, (W, H), interpolation=cv.INTER_NEAREST)
     K = np.copy(K)
     K[:2] = K[:2] * image_scaling
 
@@ -92,9 +88,10 @@ class AVRexDataset:
 
         for frame_id in frame_ids:
             for cam_id in cam_ids:
-                cam_name, img_name = annots[cam_id]['name'], f'{frame_id:08d}.jpg'
-                if path.exists(path.join(datadir, f'{cam_name}/{img_name}')) and \
-                        path.exists(path.join(datadir, f'{cam_name}/mask/pha/{img_name}')): 
+                cam_name, img_name = annots[cam_id]['name'], f'{frame_id:06d}.jpg'
+                mask_name = f'{frame_id:06d}.png'
+                if path.exists(path.join(datadir, f'images/{cam_name}/{img_name}')) and \
+                        path.exists(path.join(datadir, f'images/{cam_name}/mask/pha/{mask_name}')): 
                     indices.append( (frame_id, cam_id) )
 
         self.indices = indices
@@ -140,51 +137,26 @@ class AVRexDataset:
         smpl_params = np.load(path.join(datadir, 'smpl_params.npz'), allow_pickle=True)
         smpl_params = dict(smpl_params)
 
-        N_frame = len(smpl_params['global_orient'])
-        beta = smpl_params['betas'][0]
-        
-        # 如果是SMPL-X格式（300维），截取前10维用于SMPL
-        if len(beta) > 10:
-            beta = beta[:10]
+        N_frame = len(smpl_params['Rh'])
+        beta = smpl_params['betas'][0][:10]  # Only use first 10 shape parameters for SMPL-X
 
         pose_list, Th_list, Rh_list = [], [], []
-        expression_list, jaw_pose_list = [], []
-        
-        for frame_id in range(N_frame):
-            pose = np.concatenate([smpl_params['global_orient'][frame_id],
+        for frame_id in range(N_frame):#这里globalorient归0 对于ali数据
+            pose = np.concatenate([torch.zeros(3).float(),
                         smpl_params['body_pose'][frame_id],
                         torch.zeros(3).float(),
                         torch.zeros(6).float(),
                         smpl_params['left_hand_pose'][frame_id],
                         smpl_params['right_hand_pose'][frame_id],], axis=0)
-            Th = smpl_params['transl'][frame_id]
-            Rh = np.eye(3, dtype=np.float32)
-
-            # 加载expression和jaw_pose (如果存在)
-            if 'expression' in smpl_params:
-                expression = smpl_params['expression'][frame_id]
-            else:
-                expression = np.zeros(10, dtype=np.float32)
-                
-            if 'jaw_pose' in smpl_params:
-                jaw_pose = smpl_params['jaw_pose'][frame_id]
-            else:
-                jaw_pose = np.zeros(3, dtype=np.float32)
+            Th = smpl_params['Th'][frame_id]
+            Rh = smpl_params['Rh'][frame_id]
 
             pose_list.append(pose)
             Th_list.append(Th)
             Rh_list.append(Rh)
-            expression_list.append(expression)
-            jaw_pose_list.append(jaw_pose)
 
-        pose_data = dict(
-            pose=np.array(pose_list).astype(np.float32), 
-            Th=np.array(Th_list).astype(np.float32),
-            Rh=np.array(Rh_list).astype(np.float32), 
-            beta=beta.astype(np.float32),
-            expression=np.array(expression_list).astype(np.float32),
-            jaw_pose=np.array(jaw_pose_list).astype(np.float32)
-        )
+        pose_data = dict(pose=np.array(pose_list).astype(np.float32), Th=np.array(Th_list).astype(np.float32),
+                         Rh=np.array(Rh_list).astype(np.float32), beta=beta.astype(np.float32))
         return pose_data
 
     @staticmethod
@@ -194,9 +166,9 @@ class AVRexDataset:
     
     @staticmethod
     def load_image_mask(datadir, cam_name, frame_id):
-        image_path = path.join(datadir, f'{cam_name}/{frame_id:08d}.jpg')
+        image_path = path.join(datadir, f'images/{cam_name}/{frame_id:06d}.jpg')
         image = iio.imread(image_path)[...,:3]
-        mask_path = path.join(datadir, f'{cam_name}/mask/pha/{frame_id:08d}.jpg')
+        mask_path = path.join(datadir, f'images/{cam_name}/mask/pha/{frame_id:06d}.png')
         mask = iio.imread(mask_path)   # 1C u8
         return image, mask
 
@@ -210,7 +182,6 @@ class AVRexDataset:
 
         pose, Rh, Th, beta = self.smpl_params['pose'][frame_id], self.smpl_params['Rh'][frame_id], \
             self.smpl_params['Th'][frame_id], self.smpl_params['beta']
-        expression, jaw_pose = self.smpl_params['expression'][frame_id], self.smpl_params['jaw_pose'][frame_id]
 
         # Load camera
         K, D, w2c = self.annots[cam_id]['K'], self.annots[cam_id]['D'], self.annots[cam_id]['w2c']
@@ -225,13 +196,6 @@ class AVRexDataset:
 
             image = image.astype(np.float32) / 255
             mask = mask[:,:,0] > 128 if len(mask.shape) == 3 else mask > 128
-            # Ensure mask is exactly 2D by explicitly reshaping
-            if len(mask.shape) > 2:
-                mask = mask.reshape(mask.shape[-2], mask.shape[-1])
-            elif len(mask.shape) == 1:
-                # If somehow flattened, try to infer shape from image
-                h, w = image.shape[:2]
-                mask = mask.reshape(h, w)
             
             mask_boundary = get_mask_boundary(mask, 5)
         else:
@@ -249,8 +213,6 @@ class AVRexDataset:
             'Rh': torch.from_numpy(Rh).float(),
             'Th': torch.from_numpy(Th).float(),
             'beta': torch.from_numpy(beta).float(),
-            'expression': torch.from_numpy(expression).float(),
-            'jaw_pose': torch.from_numpy(jaw_pose).float(),
             'height': image.shape[0],
             'width': image.shape[1],
             'frame_id': frame_id,
@@ -265,25 +227,13 @@ class ThumanDataset:
                 split = 'train', image_scaling=1, is_in_memory=False):
         
         indices = []
-        annots = ThumanDataset.load_cams_data(datadir, cam_file_name='calibration.json')
-        
-        # 自动检测文件格式（6位数字 vs 8位数字）
-        self.use_6d_format = ThumanDataset.detect_file_format(datadir, frame_ids, annots)
+        annots = AVRexDataset.load_cams_data(datadir, cam_file_name='calibration.json')
         
         for frame_id in frame_ids:
             for cam_id in cam_ids:
-                cam_name = annots[cam_id]['name']
-                if self.use_6d_format:
-                    # SQ格式：6位数字
-                    img_name = f'{frame_id:06d}.jpg'
-                    mask_name = f'{frame_id:06d}.png'
-                else:
-                    # 原始THuman格式：8位数字
-                    img_name = f'{frame_id:08d}.jpg'
-                    mask_name = f'{frame_id:08d}.png'
-                
+                cam_name, img_name = annots[cam_id]['name'], f'{frame_id:08d}.jpg'
                 if path.exists(path.join(datadir, f'images/{cam_name}/{img_name}')) and \
-                        path.exists(path.join(datadir, f'masks/{cam_name}/{mask_name}')): 
+                        path.exists(path.join(datadir, f'masks/{cam_name}/{img_name}')): 
                     indices.append( (frame_id, cam_id) )
 
         self.indices = indices
@@ -308,102 +258,14 @@ class ThumanDataset:
         self.smpl_params = AVRexDataset.load_pose_data(datadir)
 
     @staticmethod
-    def load_cams_data(datadir, cam_file_name='calibration.json'):
-        with open(path.join(datadir, cam_file_name), 'r') as file:
-            data = json.load(file)
-
-        cams = []
-        
-        # 检查是否是SQ格式的嵌套结构
-        if 'cameras' in data and 'camera_poses' in data:
-            # SQ格式：有cameras和camera_poses两个部分
-            cameras_info = data['cameras']
-            poses_info = data['camera_poses']
-            
-            for cam_id_str, cam_data in cameras_info.items():
-                cam = {}
-                cam['name'] = cam_id_str
-                
-                # 从cameras部分获取内参
-                cam['K'] = np.array(cam_data['K']).astype(np.float32).reshape(3,3)
-                cam['D'] = np.array(cam_data.get('dist', [0,0,0,0,0])).astype(np.float32)
-                
-                # 从camera_poses部分获取外参
-                if cam_id_str in poses_info:
-                    pose_data = poses_info[cam_id_str]
-                    cam['R'] = np.array(pose_data['R']).astype(np.float32).reshape(3,3)
-                    cam['T'] = np.array(pose_data['T']).astype(np.float32).reshape(3)
-                else:
-                    # 如果没有找到对应的pose，使用默认值
-                    cam['R'] = np.eye(3, dtype=np.float32)
-                    cam['T'] = np.zeros(3, dtype=np.float32)
-                
-                T, R = cam['T'], cam['R']
-                w2c = np.eye(4, dtype=np.float32)
-                w2c[:3, :3] = R
-                w2c[:3, 3] = T
-                cam['w2c'] = w2c
-                cams.append(cam)
-        else:
-            # 原始THuman格式：直接在根级别
-            for k, v in data.items():
-                cam = {}
-                cam['name'] = k
-                cam['K'] = np.array(v['K']).astype(np.float32).reshape(3,3)
-                cam['R'] = np.array(v['R']).astype(np.float32).reshape(3,3)
-                cam['T'] = np.array(v['T']).astype(np.float32).reshape(3)
-                cam['D'] = np.array(v.get('distCoeff', [0,0,0,0,0])).astype(np.float32)
-                T, R = cam['T'], cam['R']
-                w2c = np.block([[R, T.reshape(3,1)], [np.array([[0,0,0,1]])]])
-                cam['w2c'] = w2c
-                cams.append(cam)
-        
-        return cams
-
-    @staticmethod
-    def detect_file_format(datadir, frame_ids, annots):
-        """检测数据集使用6位数字还是8位数字格式"""
-        if not frame_ids or not annots:
-            return True  # 默认使用6位格式
-        
-        # 取第一个帧和第一个相机进行检测
-        test_frame = frame_ids[0]
-        test_cam = annots[0]['name']
-        
-        # 检查6位数字格式
-        img_6d = f'{test_frame:06d}.jpg'
-        mask_6d = f'{test_frame:06d}.png'
-        if path.exists(path.join(datadir, f'images/{test_cam}/{img_6d}')) and \
-           path.exists(path.join(datadir, f'masks/{test_cam}/{mask_6d}')):
-            return True
-        
-        # 检查8位数字格式
-        img_8d = f'{test_frame:08d}.jpg'
-        mask_8d = f'{test_frame:08d}.png'
-        if path.exists(path.join(datadir, f'images/{test_cam}/{img_8d}')) and \
-           path.exists(path.join(datadir, f'masks/{test_cam}/{mask_8d}')):
-            return False
-        
-        # 默认返回6位格式
-        return True
-
-    @staticmethod
     def get_scene_scale(datadir):
-        cams = ThumanDataset.load_cams_data(datadir, cam_file_name='calibration.json')
-        return get_scene_scale(cams)
+        return AVRexDataset.get_scene_scale(datadir, cam_file_name='calibration.json')
 
     @staticmethod
-    def load_image_mask(datadir, cam_name, frame_id, use_6d_format=True):
-        if use_6d_format:
-            # SQ格式：6位数字
-            image_path = path.join(datadir, f'images/{cam_name}/{frame_id:06d}.jpg')
-            mask_path = path.join(datadir, f'masks/{cam_name}/{frame_id:06d}.png')
-        else:
-            # 原始THuman格式：8位数字
-            image_path = path.join(datadir, f'images/{cam_name}/{frame_id:08d}.jpg')
-            mask_path = path.join(datadir, f'masks/{cam_name}/{frame_id:08d}.png')
-        
+    def load_image_mask(datadir, cam_name, frame_id):
+        image_path = path.join(datadir, f'images/{cam_name}/{frame_id:08d}.jpg')
         image = iio.imread(image_path)[...,:3]
+        mask_path = path.join(datadir, f'masks/{cam_name}/{frame_id:08d}.jpg')
         mask = iio.imread(mask_path)   # 1C u8
         return image, mask
 
@@ -417,7 +279,6 @@ class ThumanDataset:
 
         pose, Rh, Th, beta = self.smpl_params['pose'][frame_id], self.smpl_params['Rh'][frame_id], \
             self.smpl_params['Th'][frame_id], self.smpl_params['beta']
-        expression, jaw_pose = self.smpl_params['expression'][frame_id], self.smpl_params['jaw_pose'][frame_id]
 
         # Load camera
         K, D, w2c = self.annots[cam_id]['K'], self.annots[cam_id]['D'], self.annots[cam_id]['w2c']
@@ -426,7 +287,7 @@ class ThumanDataset:
         # avatarrex camera: W2C  down y 
 
         if self.is_load_image:
-            image, mask = ThumanDataset.load_image_mask(self.datadir, cam_name, frame_id, self.use_6d_format)
+            image, mask = ThumanDataset.load_image_mask(self.datadir, cam_name, frame_id)
             image, mask = apply_distortion([image, mask], K, D)
             image, mask, K = resize_image(image, mask, K, self.image_scaling)
 
@@ -439,24 +300,16 @@ class ThumanDataset:
             mask = np.zeros((100, 100), dtype=bool)
             mask_boundary = mask
 
-        # Final validation: ensure mask is exactly 2D before creating tensor
-        if len(mask.shape) != 2:
-            mask = mask.reshape(image.shape[0], image.shape[1])
-        
-        mask_tensor = torch.from_numpy(mask)
-
         data = {
             'K': torch.from_numpy(K).float(),
             'w2c': torch.from_numpy(w2c).float(),
             'image': torch.from_numpy(image).float(),
-            'mask': mask_tensor, 
+            'mask': torch.from_numpy(mask), 
             'mask_boundary': torch.from_numpy(mask_boundary),
             'pose': torch.from_numpy(pose).float(),
             'Rh': torch.from_numpy(Rh).float(),
             'Th': torch.from_numpy(Th).float(),
             'beta': torch.from_numpy(beta).float(),
-            'expression': torch.from_numpy(expression).float(),
-            'jaw_pose': torch.from_numpy(jaw_pose).float(),
             'height': image.shape[0],
             'width': image.shape[1],
             'frame_id': frame_id,
@@ -569,7 +422,6 @@ class ActorsHQDataset:
 
         pose, Rh, Th, beta = self.smpl_params['pose'][frame_id], self.smpl_params['Rh'][frame_id], \
             self.smpl_params['Th'][frame_id], self.smpl_params['beta']
-        expression, jaw_pose = self.smpl_params['expression'][frame_id], self.smpl_params['jaw_pose'][frame_id]
 
         # Load camera
         K, D, w2c = self.annots[cam_id]['K'], self.annots[cam_id]['D'], self.annots[cam_id]['w2c']
@@ -582,13 +434,6 @@ class ActorsHQDataset:
 
             image = image.astype(np.float32) / 255
             mask = mask[:,:,0] > 128 if len(mask.shape) == 3 else mask > 128
-            # Ensure mask is exactly 2D by explicitly reshaping
-            if len(mask.shape) > 2:
-                mask = mask.reshape(mask.shape[-2], mask.shape[-1])
-            elif len(mask.shape) == 1:
-                # If somehow flattened, try to infer shape from image
-                h, w = image.shape[:2]
-                mask = mask.reshape(h, w)
             
             mask_boundary = get_mask_boundary(mask, 4)
         else:
@@ -606,8 +451,6 @@ class ActorsHQDataset:
             'Rh': torch.from_numpy(Rh).float(),
             'Th': torch.from_numpy(Th).float(),
             'beta': torch.from_numpy(beta).float(),
-            'expression': torch.from_numpy(expression).float(),
-            'jaw_pose': torch.from_numpy(jaw_pose).float(),
             'height': image.shape[0],
             'width': image.shape[1],
             'frame_id': frame_id,

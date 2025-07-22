@@ -25,7 +25,7 @@ test:
   image_scaling: 1
 
 # optimization
-iterations: 800_000
+iterations: 20_000
 position_lr: 0.00016
 opacity_lr: 0.0005
 scaling_lr: 0.0005

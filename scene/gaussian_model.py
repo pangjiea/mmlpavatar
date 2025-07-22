@@ -12,6 +12,39 @@ from torch.optim.lr_scheduler import ExponentialLR
 from pytorch3d.ops import knn_points
 from gsplat import rasterization, quat_scale_to_covar_preci, spherical_harmonics
 
+def axis_angle_to_matrix(axis_angle: torch.Tensor) -> torch.Tensor:
+    """
+    Convert rotations given as axis/angle to rotation matrices.
+    Same as in talkbody4D.py
+    """
+    angles = torch.norm(axis_angle, p=2, dim=-1, keepdim=True)
+    axis = axis_angle / (angles + 1e-6)  # Avoid division by zero
+    x, y, z = torch.unbind(axis, dim=-1)
+
+    sin_theta = torch.sin(angles)
+    cos_theta = torch.cos(angles)
+    one_minus_cos_theta = 1 - cos_theta
+
+    o = torch.zeros_like(x)
+    K = torch.stack(
+        [
+            torch.stack([o, -z, y], dim=-1),
+            torch.stack([z, o, -x], dim=-1),
+            torch.stack([-y, x, o], dim=-1),
+        ],
+        dim=-2,
+    )
+
+    eye = torch.eye(3, dtype=axis_angle.dtype, device=axis_angle.device)
+    eye = eye.expand(*axis_angle.shape[:-1], 3, 3)
+    R = (
+        eye
+        + sin_theta.unsqueeze(-1) * K
+        + one_minus_cos_theta.unsqueeze(-1) * torch.matmul(K, K)
+    )
+
+    return R
+
 from scene.mlp import MLP, vmap_mlp
 from utils.smpl_utils import smpl, interpolate_skinningfield, rigid_transform_tensor, rigid_transform_numba
 from utils.config_utils import Config
@@ -381,9 +414,22 @@ class GaussianModel:
     @property
     def get_xyz(self):
         if 'get_xyz' in self.cache_dict: return self.cache_dict['get_xyz']
+        
+        # Step 1: 获取canonical坐标（SMPL/SMPLX在T-pose或zero-pose下的坐标）
         xyz = self.get_cano_xyz
+        
+        # Step 2: 应用Linear Blend Skinning (LBS)变换
+        # 根据姿态参数（smpl_poses）和关节权重进行骨骼绑定变换
         xyz = torch.einsum('vij,vj->vi', self.get_Gweights, F.pad(xyz,(0,1),value=1))[:,:3]
-        if self.Rh is not None: xyz = torch.einsum('ij,vj->vi', self.Rh, xyz) 
+        
+        # Step 3 & 4: 应用全局变换（SQ02数据集的核心）
+        # 在SQ02格式中：
+        # - SMPLX模型使用 global_orient=0, transl=0 生成vertices
+        # - 真实的全局变换保存在Rh（旋转）和Th（平移）参数中
+        # - 变换顺序：先旋转再平移，与talkbody4D.py保持一致
+        if self.Rh is not None: 
+            # 使用右乘：xyz @ Rh.T，与talkbody4D.py中的 verts @ Rh.transpose(1, 2) 一致
+            xyz = torch.einsum('vi,ji->vj', xyz, self.Rh)  # 等价于 xyz @ Rh.T
         xyz = xyz + self.Th
 
         self.cache_dict['get_xyz'] = xyz
@@ -620,10 +666,25 @@ class GaussianModel:
     
     @Rh.setter
     def Rh(self, value):
-        if np.allclose(value.cpu().numpy(), np.eye(3), atol=1e-5):
-            self._Rh = None
+        self.cache_dict = {}  # 清空缓存，因为Rh改变了
+        
+        # 检查value的形状来判断是axis-angle还是旋转矩阵
+        if value.shape[-1] == 3 and len(value.shape) == 1:
+            # axis-angle格式 (3,) - SQ02数据集格式
+            if torch.allclose(value, torch.zeros_like(value), atol=1e-5):
+                self._Rh = None
+            else:
+                # 转换axis-angle为旋转矩阵
+                rotation_matrix = axis_angle_to_matrix(value.unsqueeze(0)).squeeze(0)  # (3, 3)
+                self._Rh = rotation_matrix.cuda(non_blocking=True)
+        elif value.shape == (3, 3):
+            # 旋转矩阵格式 (3, 3) - 其他数据集格式
+            if torch.allclose(value, torch.eye(3, device=value.device), atol=1e-5):
+                self._Rh = None
+            else:
+                self._Rh = value.cuda(non_blocking=True)
         else:
-            self._Rh = value.cuda(non_blocking=True)
+            raise ValueError(f"Rh must be either axis-angle (3,) or rotation matrix (3, 3), got shape {value.shape}")
 
     @property
     def Th(self):
@@ -631,6 +692,7 @@ class GaussianModel:
     
     @Th.setter
     def Th(self, value):
+        self.cache_dict = {}  # 清空缓存，因为Th改变了
         self._Th = value.cuda(non_blocking=True)
 
     def prepare_interpolating_weights(self, xyz_ft, xyz_vt):
