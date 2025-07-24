@@ -1,4 +1,3 @@
-
 import torch
 import numpy as np
 from torch import nn
@@ -11,6 +10,10 @@ from torch.optim import Adam, AdamW
 from torch.optim.lr_scheduler import ExponentialLR
 from pytorch3d.ops import knn_points
 from gsplat import rasterization, quat_scale_to_covar_preci, spherical_harmonics
+
+from utils.general_utils import storePly
+from utils.sh_utils import C0
+
 
 def axis_angle_to_matrix(axis_angle: torch.Tensor) -> torch.Tensor:
     """
@@ -50,6 +53,7 @@ from utils.smpl_utils import smpl, interpolate_skinningfield, rigid_transform_te
 from utils.config_utils import Config
 from utils.sh_utils import RGB2SH
 
+
 class GaussianModel:
 
     def setup_functions(self):
@@ -61,7 +65,7 @@ class GaussianModel:
         self.inverse_opacity_activation = torch.logit
 
         self.rotation_activation = F.normalize
-
+        
         self.color_activation = torch.sigmoid
         self.inverse_color_activation = torch.logit
 
@@ -86,7 +90,7 @@ class GaussianModel:
 
         self.encoder_feat_params = None
         self.encoder_feat_model_meta = None
-
+        
         self.dxyz_bs = torch.empty(0)
         self.sh0_bs = torch.empty(0)
         self.shN_bs = torch.empty(0)
@@ -183,164 +187,84 @@ class GaussianModel:
             'is_gsparam_bs': self.is_gsparam_bs,
         }
         return data
-    
-    def restore(self, data):
-        def loader(s):
-            if s in data: return data[s]
-            else: print(f'NO DATA {s}!')
-            return None
 
+    @torch.no_grad()
+    def restore(self, data):
         self._xyz = data['_xyz']
         self.xyz_offset = data['xyz_offset']
         self.dxyz_vt = data['dxyz_vt']
-        self._opacity = data['_opacity']
-        self._rotation = data['_rotation']
         self._scaling = data['_scaling']
+        self._rotation = data['_rotation']
+        self._opacity = data['_opacity']
         self._sh0 = data['_sh0']
-        self._shN = loader('_shN')
+        self._shN = data['_shN']
         self.sh_degree = data['sh_degree']
 
-        self._weights = data['_weights']
+        self.t_joints = data['t_joints']
+        self.all_poses = data['all_poses']
+        self.joint_parents = data['joint_parents']
 
-        self.t_joints = loader('t_joints')
-        self.all_poses = loader('all_poses')
-        self.joint_parents = loader('joint_parents')
+        self.nbr_gs_invdist = data['nbr_gs_invdist']
+        self.nbr_gs = data['nbr_gs']
+        self.nbr_vt = data['nbr_vt']
+        self.nbr_gsft = data['nbr_gsft']
+        self.nbr_vtft = data['nbr_vtft']
+        self.nbr_gsft_wght = data['nbr_gsft_wght']
+        self.nbr_vtft_wght = data['nbr_vtft_wght']
 
-        self.nbr_gs = loader('nbr_gs')
-        self.nbr_vt = loader('nbr_vt')
-        self.nbr_gs_invdist = loader('nbr_gs_invdist')
-        self.nbr_gsft = loader('nbr_gsft')
-        self.nbr_vtft = loader('nbr_vtft')
-        self.nbr_gsft_wght = loader('nbr_gsft_wght')
-        self.nbr_vtft_wght = loader('nbr_vtft_wght')
+        self.xyz_vt = data['xyz_vt']
+        self.xyz_ft = data['xyz_ft']
 
-        self.xyz_vt = loader('xyz_vt')
-        self.xyz_ft = loader('xyz_ft')
+        self.num_vt_basis = data['num_vt_basis']
+        self.num_basis = data['num_basis']
 
-        self.num_vt_basis = loader('num_vt_basis')
-        self.num_basis = loader('num_basis')
+        self.encoder_feat_params = data['encoder_feat_params']
+        self.encoder_feat_model_meta = data['encoder_feat_model_meta']
 
-        self.encoder_feat_params = loader('encoder_feat_params')
-        self.encoder_feat_model_meta = loader('encoder_feat_model_meta')
+        self.dxyz_bs = data['dxyz_bs']
+        self.sh0_bs = data['sh0_bs']
+        self.shN_bs = data['shN_bs']
+        self.scaling_bs = data['scaling_bs']
+        self.rotation_bs = data['rotation_bs']
+        self.opacity_bs = data['opacity_bs']
 
-        self.dxyz_bs = loader('dxyz_bs')
-        self.sh0_bs = loader('sh0_bs')
-        self.shN_bs = loader('shN_bs')
-        self.scaling_bs = loader('scaling_bs')
-        self.rotation_bs = loader('rotation_bs') 
-        self.opacity_bs = loader('opacity_bs')
+        self.is_dxyz_bs = data['is_dxyz_bs']
+        self.is_gsparam_bs = data['is_gsparam_bs']
 
-        self.is_dxyz_bs = loader('is_dxyz_bs')
-        self.is_gsparam_bs = loader('is_gsparam_bs')
+        # Derived variables
+        self.smpl_poses = torch.zeros(69)  # default
+        self.Rh = torch.eye(3)
+        self.Th = torch.zeros(3)
 
-        self.init()
+        self.cache_dict = {}
+        return self
 
-    def init(self):
-        self.init_body() 
-        self.reset_pose()   
-
-    @property
-    def get_cano_scaling(self):
-        if 'get_cano_scaling' in self.cache_dict: return self.cache_dict['get_cano_scaling'] 
-        if not self.is_gsparam_bs: 
-            scaling = self.scaling_activation(self._scaling)
-        else:
-            features = self.get_encoded_feature_gsparam_weight
-            dscaling = torch.einsum('nc,ncl->nl', features, self.scaling_bs)
-
-            scaling = self._scaling + dscaling
-            scaling = self.scaling_activation(scaling)
-        
-        self.cache_dict['get_cano_scaling'] = scaling
-        return scaling
-    
+    # Replace the simple getter for weights with a property that lazily
+    # interpolates linear blend skinning weights from the provided SMPL/SMPLX
+    # skinning field.  When `_weights` is unset this property will query
+    # `interpolate_skinningfield` on the current Gaussian positions to obtain
+    # per‑Gaussian per‑joint weights.  Results are cached in `_weights` to
+    # avoid recomputation.  This behaviour matches the official
+    # implementation and is required by downstream functions such as
+    # ``get_Gweights``.
     @property
     def get_weights(self):
+        # If weights have not yet been computed, interpolate them
         if self._weights is None:
+            # `_xyz` stores the canonical positions of Gaussians before any
+            # deformation.  We call `interpolate_skinningfield` to obtain
+            # per‑Gaussian weights for each joint based on these canonical
+            # positions and the precomputed `weights_grid_info`.
             xyz = self._xyz
             weights = interpolate_skinningfield(self.weights_grid_info, xyz)
+            # Cache the result so that subsequent accesses reuse the same
+            # tensor; this also allows overriding via `set_weights` if
+            # desired.
             self._weights = weights
-        else:
-            weights = self._weights
-        return weights
+        return self._weights
 
-    @property
-    def get_rigid_transform(self):
-        if 'get_rigid_transform' in self.cache_dict: return self.cache_dict['get_rigid_transform']
-        pose = self.smpl_poses.numpy()
-        joints = self.t_joints.numpy()
-        parent = self.joint_parents.numpy()
-        Ac_inv = self.Ac_inv.numpy()
-
-        rots = Rotation.from_rotvec(pose.reshape(-1,3)).as_matrix().astype(np.float32)
-        A = rigid_transform_numba(rots, joints, parent)
-        G = np.matmul(A, Ac_inv)
-
-        data = [torch.as_tensor(d).cuda(non_blocking=True) for d in [rots, G]]
-        self.cache_dict['get_rigid_transform'] = data
-        return data
-
-    @property
-    def get_Gweights(self):
-        if 'get_Gweights' in self.cache_dict: return self.cache_dict['get_Gweights']
-
-        # Rots = batch_rodrigues(self.smpl_poses.reshape(-1,3))
-        # A = batch_rigid_transform(Rots[None], self.t_joints[None], self.joint_parents)[1][0]
-        # G = torch.matmul(A, self.Ac_inv)
-        
-        G = self.get_rigid_transform[1]
-        G_weight = torch.einsum('vp,pij->vij', self.get_weights, G)
-
-        self.cache_dict['get_Gweights'] = G_weight
-        return G_weight
-
-    @property
-    def get_cano_rotation(self):
-        if not self.is_gsparam_bs: 
-            rotation = self.rotation_activation(self._rotation)
-        else:
-            features = self.get_encoded_feature_gsparam_weight
-            drotation = torch.einsum('nc,ncl->nl', features, self.rotation_bs)
-
-            rotation = self._rotation + drotation
-            rotation = self.rotation_activation(rotation)
-
-        return rotation
-
-    def get_covariance(self, scaling_modifier=1):
-        rots = self.get_Gweights[:,:3,:3].contiguous()
-        covs = quat_scale_to_covar_preci(
-            quats=self.get_cano_rotation,
-            scales=self.get_cano_scaling * scaling_modifier,
-            compute_preci=False,
-        )[0]
-
-        if self.Rh is not None: rots = self.Rh @ rots
-        covs = rots @ covs @ rots.transpose(-1,-2)
-        return covs
-
-    @property
-    def get_joint_features(self):
-
-        if self.is_test:
-            sigma_pca = 2.0
-            features = self.smpl_poses_cuda[1*3:22*3][None]
-            lowdim_pose_conds = self.pca.transform(features)
-            std = self.pca_std
-            lowdim_pose_conds = torch.maximum(lowdim_pose_conds, -sigma_pca * std)
-            lowdim_pose_conds = torch.minimum(lowdim_pose_conds, sigma_pca * std)
-            body_features = self.pca.inverse_transform(lowdim_pose_conds).reshape(-1)
-        else:
-            body_features = self.smpl_poses_cuda[3:3*22]  # 63维 body poses
-
-        # 拼接表情和下颌参数
-        expression_cuda = self.expression.cuda()  # 10维
-        jaw_pose_cuda = self.jaw_pose.cuda()      # 3维
-        
-        # 组合成76维特征: body(63) + expression(10) + jaw(3)
-        features = torch.cat([body_features, expression_cuda, jaw_pose_cuda])
-
-        return features
+    def set_weights(self, value):
+        self._weights = value
 
     @torch.no_grad()
     def prepare_test(self):
@@ -614,6 +538,48 @@ class GaussianModel:
         
         self.cache_dict = {}
 
+    @torch.no_grad()
+    def export_gaussians_to_ply(self, filepath: str, cam_pos: torch.Tensor = None) -> None:
+        """
+        Export the current set of Gaussian centers and colors to a PLY file.
+
+        This function extracts the 3D mean positions of all Gaussians as well as
+        a representative color for each point and writes them to a binary PLY
+        using ``storePly`` from ``utils.general_utils``.
+
+        Args:
+            filepath (str): The path to the .ply file that will be created.
+            cam_pos (torch.Tensor or None): Optional camera position from which
+                view‑dependent colours should be computed. If ``None``, the method
+                uses only the degree‑zero spherical harmonic coefficient (DC colour)
+                to derive view‑independent colours.
+        """
+        # Reset the cache so that updated poses or transforms propagate to the xyz
+        self.cache_dict = {}
+        # Fetch Gaussian means on the CPU
+        xyz_tensor = self.get_xyz
+        xyz_np = xyz_tensor.detach().cpu().numpy()
+
+        # Compute RGB colours
+        if cam_pos is None:
+            # Use the DC SH coefficient to compute view‑independent colour.
+            sh0 = self._sh0.squeeze(1)  # shape [N,3]
+            colors = sh0 * C0 + 0.5
+            colors = torch.clamp(colors, 0.0, 1.0)
+            colors_np = colors.detach().cpu().numpy()
+        else:
+            # Accept numpy or torch input for cam_pos and lift to the model device.
+            if not isinstance(cam_pos, torch.Tensor):
+                cam_pos = torch.as_tensor(cam_pos, dtype=torch.float32, device=xyz_tensor.device)
+            # Use get_color to compute view‑dependent colour and clamp to [0,1]
+            colours_tensor = self.get_color(cam_pos)
+            colours_tensor = torch.clamp(colours_tensor, 0.0, 1.0)
+            colors_np = colours_tensor.detach().cpu().numpy()
+        # Convert [0,1] floats to uint8
+        rgb = (colors_np * 255.0).astype(np.uint8)
+        # Write out the PLY file
+        storePly(filepath, xyz_np, rgb)
+
     def render(self, cam, override_color=None, scaling_modifier=1.0, background=None):
         sh = self.get_sh      # can be faster
         covars = self.get_covariance(scaling_modifier)
@@ -740,3 +706,137 @@ class GaussianModel:
         nbr_gs_wght = nbr_gs_invdist / torch.sum(nbr_gs_invdist, dim=-1, keepdim=True)
         self.nbr_vtft = nbr_gs
         self.nbr_vtft_wght = nbr_gs_wght
+
+    # === Canonical gaussian property queries ===
+    @property
+    def get_cano_scaling(self):
+        """Return per‑Gaussian scaling factors in canonical pose.
+
+        The learnable parameter ``_scaling`` is exponentiated via
+        ``scaling_activation`` to obtain positive scale values.  When Gaussian
+        parameter basis functions are enabled (``is_gsparam_bs``), the scales are
+        modulated by the encoded features and the learned ``scaling_bs``.
+        """
+        # Check cache first
+        if 'get_cano_scaling' in self.cache_dict:
+            return self.cache_dict['get_cano_scaling']
+        if not self.is_gsparam_bs:
+            scaling = self.scaling_activation(self._scaling)
+        else:
+            features = self.get_encoded_feature_gsparam_weight
+            # Modulate each dimension of the scale using the features and basis weights
+            dscaling = torch.einsum('nc,ncl->nl', features, self.scaling_bs)
+            scaling = self._scaling + dscaling
+            scaling = self.scaling_activation(scaling)
+        self.cache_dict['get_cano_scaling'] = scaling
+        return scaling
+
+    @property
+    def get_rigid_transform(self):
+        """Compute the rigid transforms for each skeletal joint.
+
+        This method converts the current SMPL/SMPLX pose parameters
+        ``smpl_poses`` into rotation matrices, applies the forward
+        kinematics to obtain absolute transforms for each joint, and then
+        multiplies by the inverse of the canonical transforms ``Ac_inv`` to
+        produce transforms relative to the T‑pose.  The result is a list
+        containing the raw rotation matrices and the rigid transforms ``G``.
+        """
+        if 'get_rigid_transform' in self.cache_dict:
+            return self.cache_dict['get_rigid_transform']
+        # Convert pose from axis‑angle to rotation matrices on CPU for the numba function
+        pose = self.smpl_poses.numpy()
+        joints = self.t_joints.numpy()
+        parent = self.joint_parents.numpy()
+        Ac_inv = self.Ac_inv.numpy()
+        rots = Rotation.from_rotvec(pose.reshape(-1, 3)).as_matrix().astype(np.float32)
+        A = rigid_transform_numba(rots, joints, parent)
+        G = np.matmul(A, Ac_inv)
+        data = [torch.as_tensor(d).cuda(non_blocking=True) for d in [rots, G]]
+        self.cache_dict['get_rigid_transform'] = data
+        return data
+
+    @property
+    def get_Gweights(self):
+        """Return the weighted combination of rigid transforms for each Gaussian.
+
+        Each Gaussian has per‑joint weights stored in ``get_weights``.  These
+        weights are used to blend the per‑joint rigid transforms ``G`` into
+        a single transform matrix for each Gaussian via a weighted sum.
+        """
+        if 'get_Gweights' in self.cache_dict:
+            return self.cache_dict['get_Gweights']
+        G = self.get_rigid_transform[1]
+        G_weight = torch.einsum('vp,pij->vij', self.get_weights, G)
+        self.cache_dict['get_Gweights'] = G_weight
+        return G_weight
+
+    @property
+    def get_cano_rotation(self):
+        """Return per‑Gaussian rotation quaternions in canonical pose.
+
+        Quaternions are stored in ``_rotation``; ``rotation_activation``
+        normalizes them to unit length.  When basis functions are used,
+        quaternions are modulated by the encoded features and ``rotation_bs``.
+        """
+        if not self.is_gsparam_bs:
+            rotation = self.rotation_activation(self._rotation)
+        else:
+            features = self.get_encoded_feature_gsparam_weight
+            drotation = torch.einsum('nc,ncl->nl', features, self.rotation_bs)
+            rotation = self._rotation + drotation
+            rotation = self.rotation_activation(rotation)
+        return rotation
+
+    def get_covariance(self, scaling_modifier: float = 1.0):
+        """Compute full covariance matrices for each Gaussian in world coordinates.
+
+        This method converts the canonical scale and rotation parameters into
+        3×3 covariance matrices via ``quat_scale_to_covar_preci``.  The
+        resulting covariances are then rotated by the per‑Gaussian blend
+        weights and optionally by the global rotation ``Rh``.  Setting
+        ``scaling_modifier`` allows the caller to uniformly scale the
+        Gaussians for, e.g., visualization.
+
+        Args:
+            scaling_modifier (float): A multiplicative factor applied to the
+                scales before converting to covariance.
+        Returns:
+            torch.Tensor: A tensor of shape ``(N, 3, 3)`` containing the
+                covariance matrices for each Gaussian.
+        """
+        # Extract the rotation part of the blended transforms
+        rots = self.get_Gweights[:, :3, :3].contiguous()
+        covs = quat_scale_to_covar_preci(
+            quats=self.get_cano_rotation,
+            scales=self.get_cano_scaling * scaling_modifier,
+            compute_preci=False,
+        )[0]
+        if self.Rh is not None:
+            rots = self.Rh @ rots
+        covs = rots @ covs @ rots.transpose(-1, -2)
+        return covs
+
+    @property
+    def get_joint_features(self):
+        """Assemble joint feature vector for the pose encoder.
+
+        The feature vector comprises the body pose (63 dimensions) plus
+        facial expression (10) and jaw pose (3), resulting in a 76‑dimensional
+        vector.  In test mode, a PCA model is applied to project and clamp
+        the pose before reconstructing the full body pose.
+        """
+        if self.is_test:
+            sigma_pca = 2.0
+            features = self.smpl_poses_cuda[1 * 3 : 22 * 3][None]
+            lowdim_pose_conds = self.pca.transform(features)
+            std = self.pca_std
+            lowdim_pose_conds = torch.maximum(lowdim_pose_conds, -sigma_pca * std)
+            lowdim_pose_conds = torch.minimum(lowdim_pose_conds, sigma_pca * std)
+            body_features = self.pca.inverse_transform(lowdim_pose_conds).reshape(-1)
+        else:
+            body_features = self.smpl_poses_cuda[3 : 3 * 22]
+        expression_cuda = self.expression.cuda()
+        jaw_pose_cuda = self.jaw_pose.cuda()
+        features = torch.cat([body_features, expression_cuda, jaw_pose_cuda])
+        return features
