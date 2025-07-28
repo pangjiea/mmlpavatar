@@ -1,4 +1,3 @@
-
 import torch
 import numpy as np
 from torch import nn
@@ -267,10 +266,10 @@ class GaussianModel:
     @property
     def get_rigid_transform(self):
         if 'get_rigid_transform' in self.cache_dict: return self.cache_dict['get_rigid_transform']
-        pose = self.smpl_poses.numpy()
-        joints = self.t_joints.numpy()
-        parent = self.joint_parents.numpy()
-        Ac_inv = self.Ac_inv.numpy()
+        pose = self.smpl_poses.cpu().numpy()
+        joints = self.t_joints.cpu().numpy()
+        parent = self.joint_parents.cpu().numpy()
+        Ac_inv = self.Ac_inv.cpu().numpy()
 
         rots = Rotation.from_rotvec(pose.reshape(-1,3)).as_matrix().astype(np.float32)
         A = rigid_transform_numba(rots, joints, parent)
@@ -740,3 +739,292 @@ class GaussianModel:
         nbr_gs_wght = nbr_gs_invdist / torch.sum(nbr_gs_invdist, dim=-1, keepdim=True)
         self.nbr_vtft = nbr_gs
         self.nbr_vtft_wght = nbr_gs_wght
+
+    def save_gaussian_sequence_to_ply(self, smpl_params_path, output_dir, frame_start=0, frame_end=None, frame_step=1, format_type='standard'):
+        """
+        保存Gaussian点的全局坐标序列为PLY文件
+
+        Args:
+            smpl_params_path: SMPL参数文件路径 (.npz)
+            output_dir: 输出目录
+            frame_start: 起始帧 (默认0)
+            frame_end: 结束帧 (默认None表示到最后一帧)
+            frame_step: 帧步长 (默认1)
+            format_type: PLY格式类型 ('standard' 标准Gaussian Splatting格式, 'simple' 简化点云格式)
+        """
+        from plyfile import PlyData, PlyElement
+        import os
+
+        # 创建输出目录
+        os.makedirs(output_dir, exist_ok=True)
+
+        # 加载SMPL参数
+        smpl_data = np.load(smpl_params_path, allow_pickle=True)
+
+        # 解析SMPL参数格式
+        poses, transl, expressions, jaw_poses = self._parse_smpl_params(smpl_data)
+
+        # 确定帧范围
+        total_frames = len(poses)
+        if frame_end is None:
+            frame_end = total_frames
+        frame_end = min(frame_end, total_frames)
+
+        print(f"开始保存Gaussian点序列 ({format_type}格式): 帧 {frame_start} 到 {frame_end-1}, 步长 {frame_step}")
+        print(f"总共 {len(range(frame_start, frame_end, frame_step))} 个PLY文件")
+
+        for frame_idx in range(frame_start, frame_end, frame_step):
+            # 设置当前帧的姿态参数
+            self._set_frame_params(poses[frame_idx], transl[frame_idx],
+                                 expressions[frame_idx] if expressions is not None else None,
+                                 jaw_poses[frame_idx] if jaw_poses is not None else None)
+
+            # 获取当前帧的Gaussian属性并保存
+            with torch.no_grad():
+                if format_type == 'standard':
+                    self._save_standard_ply(output_dir, frame_idx)
+                else:  # simple
+                    self._save_simple_ply(output_dir, frame_idx)
+
+            if frame_idx % 50 == 0:
+                print(f"已保存帧 {frame_idx}")
+
+        print(f"完成! 所有PLY文件已保存到: {output_dir}")
+
+    def _parse_smpl_params(self, smpl_data):
+        """解析SMPL参数文件"""
+        print("Available keys in SMPL file:", list(smpl_data.keys()))
+
+        # 处理不同的参数格式
+        if 'pose' in smpl_data:
+            # 格式1: 直接包含完整pose参数
+            poses = smpl_data['pose']
+        elif 'global_orient' in smpl_data and 'body_pose' in smpl_data:
+            # 格式2: 分离的参数，需要组合
+            global_orient = smpl_data['global_orient']
+            body_pose = smpl_data['body_pose']
+            left_hand_pose = smpl_data.get('left_hand_pose', np.zeros((len(global_orient), 45)))
+            right_hand_pose = smpl_data.get('right_hand_pose', np.zeros((len(global_orient), 45)))
+
+            # 组合为完整pose参数 [global_orient(3) + body_pose(63) + padding(9) + hands(90)] = 165维
+            poses = []
+            for i in range(len(global_orient)):
+                pose = np.concatenate([
+                    global_orient[i],           # 3维全局旋转
+                    body_pose[i],              # 63维身体姿态
+                    np.zeros(9, dtype=np.float32),   # 9维填充
+                    left_hand_pose[i],         # 45维左手姿态
+                    right_hand_pose[i],        # 45维右手姿态
+                ], axis=0)
+                poses.append(pose)
+            poses = np.array(poses)
+        else:
+            raise ValueError("SMPL参数文件格式不支持，需要包含'pose'或'global_orient'+'body_pose'")
+
+        # 平移参数
+        transl = smpl_data.get('transl', smpl_data.get('Th', np.zeros((len(poses), 3))))
+
+        # 表情参数
+        expressions = smpl_data.get('expression', None)
+        if expressions is not None:
+            expressions = expressions[:, :10]  # 只使用前10维
+
+        # 下颌参数
+        jaw_poses = smpl_data.get('jaw_pose', None)
+
+        return poses, transl, expressions, jaw_poses
+
+    def _set_frame_params(self, pose, transl, expression=None, jaw_pose=None):
+        """设置当前帧的参数"""
+        self.smpl_poses = torch.from_numpy(pose).float()
+        self.Th = torch.from_numpy(transl).float()
+        self.Rh = torch.eye(3, dtype=torch.float32)  # 使用单位矩阵
+
+        if expression is not None:
+            self.expression = torch.from_numpy(expression).float()
+        if jaw_pose is not None:
+            self.jaw_pose = torch.from_numpy(jaw_pose).float()
+
+    def _save_standard_ply(self, output_dir, frame_idx):
+        """保存标准Gaussian Splatting格式的PLY文件"""
+        from plyfile import PlyData, PlyElement
+
+        xyz = self.get_xyz.detach().cpu().numpy()
+        normals = np.zeros_like(xyz)
+
+        # 获取球谐函数特征
+        sh = self.get_sh.detach().cpu().numpy()
+        f_dc = sh[:, :1, :].transpose(0, 2, 1).reshape(-1, 3)  # [N, 3] DC分量
+        if sh.shape[1] > 1:
+            f_rest = sh[:, 1:, :].transpose(0, 2, 1).reshape(-1, (sh.shape[1]-1)*3)  # [N, rest*3]
+        else:
+            f_rest = np.zeros((xyz.shape[0], 0))
+
+        # 获取并处理Gaussian属性
+        opacities = self.get_opacity.detach().cpu().numpy()
+        scale = self.get_cano_scaling.detach().cpu().numpy()
+        rotation = self.get_cano_rotation.detach().cpu().numpy()
+
+        # 修复Gaussian Splatting属性
+        opacities, scale, rotation = self._fix_gaussian_attributes(opacities, scale, rotation)
+
+        # 构建属性列表
+        attributes = ['x', 'y', 'z', 'nx', 'ny', 'nz']
+        attributes.extend(['f_dc_0', 'f_dc_1', 'f_dc_2'])
+        for i in range(f_rest.shape[1]):
+            attributes.append(f'f_rest_{i}')
+        attributes.append('opacity')
+        attributes.extend(['scale_0', 'scale_1', 'scale_2'])
+        attributes.extend(['rot_0', 'rot_1', 'rot_2', 'rot_3'])
+
+        dtype_full = [(attribute, 'f4') for attribute in attributes]
+        elements = np.empty(xyz.shape[0], dtype=dtype_full)
+
+        # 组合所有属性
+        if f_rest.shape[1] > 0:
+            attributes_array = np.concatenate((xyz, normals, f_dc, f_rest,
+                                             opacities.reshape(-1, 1), scale, rotation), axis=1)
+        else:
+            attributes_array = np.concatenate((xyz, normals, f_dc,
+                                             opacities.reshape(-1, 1), scale, rotation), axis=1)
+
+        elements[:] = list(map(tuple, attributes_array))
+        el = PlyElement.describe(elements, 'vertex')
+
+        # 保存PLY文件
+        ply_path = os.path.join(output_dir, f"gaussian_frame_{frame_idx:06d}.ply")
+        PlyData([el]).write(ply_path)
+
+    def _fix_gaussian_attributes(self, opacities, scale, rotation):
+        """修复Gaussian Splatting属性以确保正确显示"""
+
+        # 1. 修复透明度：确保在[0,1]范围内，并应用sigmoid激活
+        opacities = np.clip(opacities, -10, 10)  # 避免极值
+        opacities = 1.0 / (1.0 + np.exp(-opacities))  # sigmoid激活
+
+        # 2. 修复缩放：限制最大缩放值，避免过大的球
+        scale = np.exp(scale)  # 通常scale是log空间的
+        scale = np.clip(scale, 1e-6, 0.1)  # 限制缩放范围，0.1是一个合理的最大值
+
+        # 3. 修复旋转：确保四元数归一化
+        rotation_norm = np.linalg.norm(rotation, axis=1, keepdims=True)
+        rotation_norm = np.maximum(rotation_norm, 1e-8)  # 避免除零
+        rotation = rotation / rotation_norm
+
+        return opacities, scale, rotation
+
+    def _save_simple_ply(self, output_dir, frame_idx):
+        """保存简化点云格式的PLY文件"""
+        from utils.general_utils import storePly
+
+        xyz_global = self.get_xyz.cpu().numpy()
+
+        # 基于球谐函数生成颜色
+        sh = self.get_sh.cpu().numpy()
+        if sh.shape[1] > 0:
+            sh_colors = sh[:, 0, :]  # 取第0阶球谐系数
+            colors = np.clip((sh_colors + 0.5) * 255, 0, 255).astype(np.uint8)
+        else:
+            # 如果没有球谐函数，使用位置着色
+            colors = np.clip((xyz_global - xyz_global.min()) / (xyz_global.max() - xyz_global.min()) * 255, 0, 255).astype(np.uint8)
+
+        # 保存PLY文件
+        ply_path = os.path.join(output_dir, f"gaussian_frame_{frame_idx:06d}.ply")
+        storePly(ply_path, xyz_global, colors)
+
+    def save_current_frame_to_ply(self, output_path, format_type='simple', color_mode='sh'):
+        """
+        保存当前帧的Gaussian点为PLY文件
+
+        Args:
+            output_path: 输出PLY文件路径
+            format_type: PLY格式类型 ('standard' 标准Gaussian Splatting格式, 'simple' 简化点云格式)
+            color_mode: 着色模式，仅在simple格式下有效 ('position', 'opacity', 'sh', 'uniform')
+        """
+        import os
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+        with torch.no_grad():
+            if format_type == 'standard':
+                self._save_standard_ply_to_path(output_path)
+            else:  # simple
+                self._save_simple_ply_to_path(output_path, color_mode)
+
+    def _save_standard_ply_to_path(self, output_path):
+        """保存标准Gaussian Splatting格式的PLY文件到指定路径"""
+        from plyfile import PlyData, PlyElement
+
+        xyz = self.get_xyz.detach().cpu().numpy()
+        normals = np.zeros_like(xyz)
+
+        # 获取球谐函数特征
+        sh = self.get_sh.detach().cpu().numpy()
+        f_dc = sh[:, :1, :].transpose(0, 2, 1).reshape(-1, 3)  # [N, 3] DC分量
+        if sh.shape[1] > 1:
+            f_rest = sh[:, 1:, :].transpose(0, 2, 1).reshape(-1, (sh.shape[1]-1)*3)  # [N, rest*3]
+        else:
+            f_rest = np.zeros((xyz.shape[0], 0))
+
+        # 获取并处理Gaussian属性
+        opacities = self.get_opacity.detach().cpu().numpy()
+        scale = self.get_cano_scaling.detach().cpu().numpy()
+        rotation = self.get_cano_rotation.detach().cpu().numpy()
+
+        # 修复Gaussian Splatting属性
+        opacities, scale, rotation = self._fix_gaussian_attributes(opacities, scale, rotation)
+
+        # 构建属性列表
+        attributes = ['x', 'y', 'z', 'nx', 'ny', 'nz']
+        attributes.extend(['f_dc_0', 'f_dc_1', 'f_dc_2'])
+        for i in range(f_rest.shape[1]):
+            attributes.append(f'f_rest_{i}')
+        attributes.append('opacity')
+        attributes.extend(['scale_0', 'scale_1', 'scale_2'])
+        attributes.extend(['rot_0', 'rot_1', 'rot_2', 'rot_3'])
+
+        dtype_full = [(attribute, 'f4') for attribute in attributes]
+        elements = np.empty(xyz.shape[0], dtype=dtype_full)
+
+        # 组合所有属性
+        if f_rest.shape[1] > 0:
+            attributes_array = np.concatenate((xyz, normals, f_dc, f_rest,
+                                             opacities.reshape(-1, 1), scale, rotation), axis=1)
+        else:
+            attributes_array = np.concatenate((xyz, normals, f_dc,
+                                             opacities.reshape(-1, 1), scale, rotation), axis=1)
+
+        elements[:] = list(map(tuple, attributes_array))
+        el = PlyElement.describe(elements, 'vertex')
+        PlyData([el]).write(output_path)
+
+    def _save_simple_ply_to_path(self, output_path, color_mode='sh'):
+        """保存简化点云格式的PLY文件到指定路径"""
+        from utils.general_utils import storePly
+
+        xyz_global = self.get_xyz.cpu().numpy()
+
+        # 根据着色模式生成颜色
+        if color_mode == 'position':
+            # 基于位置的着色
+            colors = np.clip((xyz_global - xyz_global.min()) / (xyz_global.max() - xyz_global.min()) * 255, 0, 255).astype(np.uint8)
+        elif color_mode == 'opacity':
+            # 基于透明度的着色
+            opacity = self.get_opacity.cpu().numpy()
+            opacity_normalized = (opacity - opacity.min()) / (opacity.max() - opacity.min())
+            colors = np.stack([opacity_normalized * 255, opacity_normalized * 255, opacity_normalized * 255], axis=1).astype(np.uint8)
+        elif color_mode == 'sh':
+            # 基于球谐函数的着色
+            sh = self.get_sh.cpu().numpy()
+            if sh.shape[1] > 0:
+                sh_colors = sh[:, 0, :]  # 取第0阶球谐系数
+                colors = np.clip((sh_colors + 0.5) * 255, 0, 255).astype(np.uint8)
+            else:
+                colors = np.full((len(xyz_global), 3), 128, dtype=np.uint8)
+        elif color_mode == 'uniform':
+            # 统一颜色 (白色)
+            colors = np.full((len(xyz_global), 3), 255, dtype=np.uint8)
+        else:
+            # 默认使用位置着色
+            colors = np.clip((xyz_global - xyz_global.min()) / (xyz_global.max() - xyz_global.min()) * 255, 0, 255).astype(np.uint8)
+
+        storePly(output_path, xyz_global, colors)
