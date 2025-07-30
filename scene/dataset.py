@@ -13,6 +13,8 @@ import csv
 import torch
 import imageio.v3 as iio
 
+from utils.head_mask_utils import generate_head_mask, generate_head_mask_with_mesh_renderer, get_neck_pose_from_full_pose
+
 stm = None
 
 def data_to_cam(data: dict, non_blocking=True):
@@ -140,7 +142,7 @@ class AVRexDataset:
         N_frame = len(smpl_params['Rh'])
         beta = smpl_params['betas'][0][:10]  # Only use first 10 shape parameters for SMPL-X
 
-        pose_list, Th_list, Rh_list = [], [], []
+        pose_list, Th_list, Rh_list, expression_list, jaw_pose_list = [], [], [], [], []
         for frame_id in range(N_frame):#这里globalorient归0 对于ali数据
             pose = np.concatenate([torch.zeros(3).float(),
                         smpl_params['body_pose'][frame_id],
@@ -150,13 +152,28 @@ class AVRexDataset:
                         smpl_params['right_hand_pose'][frame_id],], axis=0)
             Th = smpl_params['Th'][frame_id]
             Rh = smpl_params['Rh'][frame_id]
+            
+            # Load expression and jaw pose if available
+            if 'expression' in smpl_params:
+                expression = smpl_params['expression'][frame_id]
+            else:
+                expression = np.zeros(50, dtype=np.float32)  # Default SMPL-X expression dim
+                
+            if 'jaw_pose' in smpl_params:
+                jaw_pose = smpl_params['jaw_pose'][frame_id]
+            else:
+                jaw_pose = np.zeros(3, dtype=np.float32)  # Default jaw pose
 
             pose_list.append(pose)
             Th_list.append(Th)
             Rh_list.append(Rh)
+            expression_list.append(expression)
+            jaw_pose_list.append(jaw_pose)
 
         pose_data = dict(pose=np.array(pose_list).astype(np.float32), Th=np.array(Th_list).astype(np.float32),
-                         Rh=np.array(Rh_list).astype(np.float32), beta=beta.astype(np.float32))
+                         Rh=np.array(Rh_list).astype(np.float32), beta=beta.astype(np.float32),
+                         expression=np.array(expression_list).astype(np.float32),
+                         jaw_pose=np.array(jaw_pose_list).astype(np.float32))
         return pose_data
 
     @staticmethod
@@ -182,6 +199,7 @@ class AVRexDataset:
 
         pose, Rh, Th, beta = self.smpl_params['pose'][frame_id], self.smpl_params['Rh'][frame_id], \
             self.smpl_params['Th'][frame_id], self.smpl_params['beta']
+        expression, jaw_pose = self.smpl_params['expression'][frame_id], self.smpl_params['jaw_pose'][frame_id]
 
         # Load camera
         K, D, w2c = self.annots[cam_id]['K'], self.annots[cam_id]['D'], self.annots[cam_id]['w2c']
@@ -198,10 +216,52 @@ class AVRexDataset:
             mask = mask[:,:,0] > 128 if len(mask.shape) == 3 else mask > 128
             
             mask_boundary = get_mask_boundary(mask, 5)
+            
+            # Generate head mask using corrected TalkBody4D projection
+            try:
+                # 使用修正后的TalkBody4D投影方法，确保头部位置正确
+                head_mask = generate_head_mask_with_mesh_renderer(
+                    pose, beta, expression, jaw_pose, Rh, Th,
+                    K, w2c, image.shape[0], image.shape[1],
+                    body_mask=mask,  # 传入全身掩膜
+                    device='cpu',
+                    use_advanced_renderer=False,  # 使用正确的TalkBody4D投影
+                    use_z_buffer=False
+                )
+                
+                # 如果head_mask是None，使用空掩膜
+                if head_mask is None:
+                    print("Head not visible, using empty head mask")
+                    head_mask = np.zeros_like(mask, dtype=bool)
+                
+                # 保存头部mask可视化（仅AVRexDataset的前几个样本）
+                if not hasattr(AVRexDataset, '_debug_sample_count'):
+                    AVRexDataset._debug_sample_count = 0
+                
+                if AVRexDataset._debug_sample_count < 5:  # 只保存前5个样本
+                    try:
+                        from utils.mask_visualization import save_head_mask_visualization
+                        debug_dir = "/home/hello/code/mmlphuman/debug_head_masks"
+                        import os
+                        os.makedirs(debug_dir, exist_ok=True)
+                        save_path = os.path.join(debug_dir, f"avrex_sample_{AVRexDataset._debug_sample_count:03d}_frame_{frame_id:06d}_cam_{cam_name}.png")
+                        save_head_mask_visualization(image, head_mask, save_path, 
+                                                   f'AVRex - Frame {frame_id}, Camera {cam_name}')
+                        AVRexDataset._debug_sample_count += 1
+                    except Exception as e:
+                        print(f"Debug: Failed to save head mask visualization: {e}")
+                        
+            except Exception as e:
+                print(f"Warning: Failed to generate head mask: {e}")
+                head_mask = np.zeros_like(mask, dtype=bool)
         else:
             image = np.zeros((100, 100, 3), dtype=np.float32)
             mask = np.zeros((100, 100), dtype=bool)
             mask_boundary = mask
+            head_mask = np.zeros((100, 100), dtype=bool)
+
+        # Extract neck pose
+        neck_pose = get_neck_pose_from_full_pose(pose)
 
         data = {
             'K': torch.from_numpy(K).float(),
@@ -209,10 +269,14 @@ class AVRexDataset:
             'image': torch.from_numpy(image).float(),
             'mask': torch.from_numpy(mask), 
             'mask_boundary': torch.from_numpy(mask_boundary),
+            'head_mask': torch.from_numpy(head_mask),
             'pose': torch.from_numpy(pose).float(),
             'Rh': torch.from_numpy(Rh).float(),
             'Th': torch.from_numpy(Th).float(),
             'beta': torch.from_numpy(beta).float(),
+            'expression': torch.from_numpy(expression).float(),
+            'jaw_pose': torch.from_numpy(jaw_pose).float(),
+            'neck_pose': neck_pose.float(),
             'height': image.shape[0],
             'width': image.shape[1],
             'frame_id': frame_id,
@@ -279,6 +343,7 @@ class ThumanDataset:
 
         pose, Rh, Th, beta = self.smpl_params['pose'][frame_id], self.smpl_params['Rh'][frame_id], \
             self.smpl_params['Th'][frame_id], self.smpl_params['beta']
+        expression, jaw_pose = self.smpl_params['expression'][frame_id], self.smpl_params['jaw_pose'][frame_id]
 
         # Load camera
         K, D, w2c = self.annots[cam_id]['K'], self.annots[cam_id]['D'], self.annots[cam_id]['w2c']
@@ -295,10 +360,34 @@ class ThumanDataset:
             mask = mask[:,:,0] > 128 if len(mask.shape) == 3 else mask > 128
             
             mask_boundary = get_mask_boundary(mask, 3)
+            
+            # 生成头部mask - 使用修正后的TalkBody4D投影
+            try:
+                head_mask = generate_head_mask_with_mesh_renderer(
+                    pose, beta, expression, jaw_pose, Rh, Th,
+                    K, w2c, image.shape[0], image.shape[1],
+                    body_mask=mask, device='cpu',  # 传入全身掩膜
+                    use_advanced_renderer=False,  # 使用正确的TalkBody4D投影
+                    use_z_buffer=False
+                )
+                
+                # 如果head_mask是None，使用几何估计
+                if head_mask is None:
+                    print("Head not visible, using geometric fallback head mask")
+                    from utils.head_mask_utils import generate_geometric_head_mask
+                    head_mask = generate_geometric_head_mask(image.shape[0], image.shape[1])
+            except Exception as e:
+                print(f"Warning: Head mask generation failed: {e}")
+                from utils.head_mask_utils import generate_geometric_head_mask
+                head_mask = generate_geometric_head_mask(image.shape[0], image.shape[1])
         else:
             image = np.zeros((100, 100, 3), dtype=np.float32)
             mask = np.zeros((100, 100), dtype=bool)
             mask_boundary = mask
+            head_mask = np.zeros((100, 100), dtype=bool)
+
+        # Extract neck pose
+        neck_pose = get_neck_pose_from_full_pose(pose)
 
         data = {
             'K': torch.from_numpy(K).float(),
@@ -306,10 +395,14 @@ class ThumanDataset:
             'image': torch.from_numpy(image).float(),
             'mask': torch.from_numpy(mask), 
             'mask_boundary': torch.from_numpy(mask_boundary),
+            'head_mask': torch.from_numpy(head_mask),
             'pose': torch.from_numpy(pose).float(),
             'Rh': torch.from_numpy(Rh).float(),
             'Th': torch.from_numpy(Th).float(),
             'beta': torch.from_numpy(beta).float(),
+            'expression': torch.from_numpy(expression).float(),
+            'jaw_pose': torch.from_numpy(jaw_pose).float(),
+            'neck_pose': neck_pose.float(),
             'height': image.shape[0],
             'width': image.shape[1],
             'frame_id': frame_id,
@@ -422,6 +515,7 @@ class ActorsHQDataset:
 
         pose, Rh, Th, beta = self.smpl_params['pose'][frame_id], self.smpl_params['Rh'][frame_id], \
             self.smpl_params['Th'][frame_id], self.smpl_params['beta']
+        expression, jaw_pose = self.smpl_params['expression'][frame_id], self.smpl_params['jaw_pose'][frame_id]
 
         # Load camera
         K, D, w2c = self.annots[cam_id]['K'], self.annots[cam_id]['D'], self.annots[cam_id]['w2c']
@@ -436,10 +530,34 @@ class ActorsHQDataset:
             mask = mask[:,:,0] > 128 if len(mask.shape) == 3 else mask > 128
             
             mask_boundary = get_mask_boundary(mask, 4)
+            
+            # 生成头部mask - 使用修正后的TalkBody4D投影
+            try:
+                head_mask = generate_head_mask_with_mesh_renderer(
+                    pose, beta, expression, jaw_pose, Rh, Th,
+                    K, w2c, image.shape[0], image.shape[1],
+                    body_mask=mask, device='cpu',  # 传入全身掩膜
+                    use_advanced_renderer=False,  # 使用正确的TalkBody4D投影
+                    use_z_buffer=False
+                )
+                
+                # 如果head_mask是None，使用几何估计
+                if head_mask is None:
+                    print("Head not visible, using geometric fallback head mask")
+                    from utils.head_mask_utils import generate_geometric_head_mask
+                    head_mask = generate_geometric_head_mask(image.shape[0], image.shape[1])
+            except Exception as e:
+                print(f"Warning: Head mask generation failed: {e}")
+                from utils.head_mask_utils import generate_geometric_head_mask
+                head_mask = generate_geometric_head_mask(image.shape[0], image.shape[1])
         else:
             image = np.zeros((100, 100, 3), dtype=np.float32)
             mask = np.zeros((100, 100), dtype=bool)
             mask_boundary = mask
+            head_mask = np.zeros((100, 100), dtype=bool)
+
+        # Extract neck pose
+        neck_pose = get_neck_pose_from_full_pose(pose)
 
         data = {
             'K': torch.from_numpy(K).float(),
@@ -447,10 +565,14 @@ class ActorsHQDataset:
             'image': torch.from_numpy(image).float(),
             'mask': torch.from_numpy(mask), 
             'mask_boundary': torch.from_numpy(mask_boundary),
+            'head_mask': torch.from_numpy(head_mask),
             'pose': torch.from_numpy(pose).float(),
             'Rh': torch.from_numpy(Rh).float(),
             'Th': torch.from_numpy(Th).float(),
             'beta': torch.from_numpy(beta).float(),
+            'expression': torch.from_numpy(expression).float(),
+            'jaw_pose': torch.from_numpy(jaw_pose).float(),
+            'neck_pose': neck_pose.float(),
             'height': image.shape[0],
             'width': image.shape[1],
             'frame_id': frame_id,

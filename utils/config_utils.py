@@ -56,6 +56,13 @@ class Config:
     scaling_threshold = 0.01
     lambda_dxyz_smooth = 0.1
     
+    # head-body separation loss weights
+    lambda_head_body_separation = 0.01
+    lambda_head_body_feature_diff = 1.0
+    lambda_head_body_spatial_sep = 1.0
+    lambda_head_consistency = 0.05
+    iteration_head_body_loss = 1000  # 从第1000次迭代开始应用头部身体分离损失
+    
     init_num_gs = 200_000
 
     # anchor points and control points

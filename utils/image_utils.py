@@ -64,6 +64,36 @@ def crop_image(bg_color_cuda, gt_mask, patch_size, randomly, *args):
     :param args: input images with shape of (C, H, W)
     """
     mask_uv = torch.argwhere(gt_mask > 0.)
+    
+    # 检查mask是否为空
+    if mask_uv.numel() == 0:
+        # 如果mask为空，返回原图像的中心区域裁剪
+        H, W = gt_mask.shape
+        cropped_images = []
+        for image in args:
+            # 从中心裁剪patch_size大小的区域
+            center_h, center_w = H // 2, W // 2
+            half_patch = patch_size // 2
+            
+            start_h = max(0, center_h - half_patch)
+            end_h = min(H, center_h + half_patch)
+            start_w = max(0, center_w - half_patch)
+            end_w = min(W, center_w + half_patch)
+            
+            cropped = image[:, start_h:end_h, start_w:end_w]
+            
+            # 如果裁剪尺寸不足patch_size，用背景色填充
+            if cropped.shape[1] != patch_size or cropped.shape[2] != patch_size:
+                padded = bg_color_cuda[:, None, None] * torch.ones((3, patch_size, patch_size), dtype=image.dtype, device=image.device)
+                actual_h, actual_w = cropped.shape[1], cropped.shape[2]
+                start_h_pad = (patch_size - actual_h) // 2
+                start_w_pad = (patch_size - actual_w) // 2
+                padded[:, start_h_pad:start_h_pad+actual_h, start_w_pad:start_w_pad+actual_w] = cropped
+                cropped = padded
+            
+            cropped_images.append(cropped)
+        return cropped_images
+    
     min_v, min_u = mask_uv.min(0)[0]
     max_v, max_u = mask_uv.max(0)[0]
     len_v = max_v - min_v

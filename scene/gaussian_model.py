@@ -48,6 +48,7 @@ from scene.mlp import MLP, vmap_mlp
 from utils.smpl_utils import smpl, interpolate_skinningfield, rigid_transform_tensor, rigid_transform_numba
 from utils.config_utils import Config
 from utils.sh_utils import RGB2SH
+import json
 
 class GaussianModel:
 
@@ -132,9 +133,97 @@ class GaussianModel:
         self.is_dxyz_bs = False     # whether to use control point basis
         self.is_gsparam_bs = False  # whether to use Gaussian property basis
 
-        self.is_test = False        # whether to use PCA 
+        self.is_test = False        # whether to use PCA
+        
+        # head-body separation
+        self.head_face_indices = None
+        self.head_gs_mask = None
+        self.body_gs_mask = None
+        self.head_encoder_params = None
+        self.body_encoder_params = None
+        self.head_encoder_model_meta = None
+        self.body_encoder_model_meta = None 
 
         self.setup_functions()
+        
+    def _load_head_face_indices(self):
+        """加载头部面片索引"""
+        if self.head_face_indices is None:
+            json_path = os.path.join(os.path.dirname(__file__), '..', 'utils', 'smplx_body_parts_2_faces.json')
+            with open(json_path, 'r') as f:
+                body_parts = json.load(f)
+            self.head_face_indices = body_parts['head']
+        
+    def _initialize_head_body_separation(self):
+        """初始化头部-身体Gaussian分离"""
+        self._load_head_face_indices()
+        
+        # 获取SMPL模型的头部顶点
+        head_vertices = self._get_head_vertices_from_smpl()
+        
+        # 基于距离来确定哪些Gaussian点属于头部
+        N = self._xyz.shape[0]
+        self.head_gs_mask = self._determine_head_gaussians(head_vertices)
+        self.body_gs_mask = ~self.head_gs_mask
+        
+        print(f"初始化头部-身体分离: 头部Gaussians {self.head_gs_mask.sum()}, 身体Gaussians {self.body_gs_mask.sum()}")
+        
+    def _get_head_vertices_from_smpl(self):
+        """从SMPL模型获取头部顶点位置"""
+        # 使用T-pose来获取头部顶点的canonical位置
+        with torch.no_grad():
+            # 创建T-pose参数
+            t_pose = torch.zeros(165, dtype=torch.float32, device='cuda')  # SMPL-X pose参数
+            beta_zero = torch.zeros(10, dtype=torch.float32, device='cuda')  # shape参数
+            expression_zero = torch.zeros(10, dtype=torch.float32, device='cuda')  # expression参数
+            jaw_pose_zero = torch.zeros(3, dtype=torch.float32, device='cuda')  # jaw_pose参数
+            
+            # 获取SMPL输出
+            smpl_output = smpl(
+                body_pose=t_pose[3:66].unsqueeze(0),
+                global_orient=t_pose[:3].unsqueeze(0),
+                betas=beta_zero.unsqueeze(0),
+                transl=torch.zeros(1, 3, device='cuda'),
+                jaw_pose=jaw_pose_zero.unsqueeze(0),
+                expression=expression_zero.unsqueeze(0)
+            )
+            
+            vertices = smpl_output.vertices[0]  # [N_vertices, 3]
+            faces = smpl.faces_tensor  # [N_faces, 3]
+            
+            # 获取头部面片的顶点
+            head_face_indices = torch.tensor(self.head_face_indices, dtype=torch.long, device='cuda')
+            head_faces = faces[head_face_indices]  # [N_head_faces, 3]
+            head_vertex_indices = torch.unique(head_faces.flatten())
+            head_vertices = vertices[head_vertex_indices]  # [N_head_vertices, 3]
+            
+            return head_vertices
+    
+    def _determine_head_gaussians(self, head_vertices, distance_threshold=0.05):
+        """基于距离确定哪些Gaussian点属于头部
+        
+        Args:
+            head_vertices: 头部顶点位置 [N_head_vertices, 3]
+            distance_threshold: 距离阈值，小于此值的Gaussian点被认为是头部
+        """
+        # 计算每个Gaussian点到头部顶点的最小距离
+        xyz = self._xyz  # [N_gaussians, 3]
+        
+        # 使用KNN找到每个Gaussian点最近的头部顶点
+        from pytorch3d.ops import knn_points
+        
+        dists, _, _ = knn_points(
+            p1=xyz.unsqueeze(0),  # [1, N_gaussians, 3]
+            p2=head_vertices.unsqueeze(0),  # [1, N_head_vertices, 3]
+            K=1
+        )
+        
+        min_distances = dists[0, :, 0]  # [N_gaussians]
+        
+        # 根据距离阈值确定头部mask
+        head_mask = min_distances < distance_threshold
+        
+        return head_mask
 
     def capture(self):
         data = {
@@ -180,6 +269,15 @@ class GaussianModel:
 
             'is_dxyz_bs': self.is_dxyz_bs,
             'is_gsparam_bs': self.is_gsparam_bs,
+            
+            # head-body separation
+            'head_face_indices': self.head_face_indices,
+            'head_gs_mask': getattr(self, 'head_gs_mask', None),
+            'body_gs_mask': getattr(self, 'body_gs_mask', None),
+            'head_encoder_params': getattr(self, 'head_encoder_params', None),
+            'body_encoder_params': getattr(self, 'body_encoder_params', None),
+            'head_encoder_model_meta': getattr(self, 'head_encoder_model_meta', None),
+            'body_encoder_model_meta': getattr(self, 'body_encoder_model_meta', None),
         }
         return data
     
@@ -231,6 +329,15 @@ class GaussianModel:
 
         self.is_dxyz_bs = loader('is_dxyz_bs')
         self.is_gsparam_bs = loader('is_gsparam_bs')
+        
+        # head-body separation
+        self.head_face_indices = loader('head_face_indices')
+        self.head_gs_mask = loader('head_gs_mask')
+        self.body_gs_mask = loader('body_gs_mask')
+        self.head_encoder_params = loader('head_encoder_params')
+        self.body_encoder_params = loader('body_encoder_params')
+        self.head_encoder_model_meta = loader('head_encoder_model_meta')
+        self.body_encoder_model_meta = loader('body_encoder_model_meta')
 
         self.init()
 
@@ -320,7 +427,14 @@ class GaussianModel:
 
     @property
     def get_joint_features(self):
-
+        return self._get_joint_features_for_type('all')
+    
+    def _get_joint_features_for_type(self, feature_type='all'):
+        """获取不同类型的特征
+        
+        Args:
+            feature_type: 'all', 'head', 'body'
+        """
         if self.is_test:
             sigma_pca = 2.0
             features = self.smpl_poses_cuda[1*3:22*3][None]
@@ -332,12 +446,37 @@ class GaussianModel:
         else:
             body_features = self.smpl_poses_cuda[3:3*22]  # 63维 body poses
 
-        # 拼接表情和下颌参数
-        expression_cuda = self.expression.cuda()  # 10维
-        jaw_pose_cuda = self.jaw_pose.cuda()      # 3维
+        # 获取neck pose (从body pose中提取)
+        neck_pose = body_features[12*3:12*3+3]  # neck pose在body pose的第12个关节
         
-        # 组合成76维特征: body(63) + expression(10) + jaw(3)
-        features = torch.cat([body_features, expression_cuda, jaw_pose_cuda])
+        # 根据类型返回不同的特征组合
+        if feature_type == 'head':
+            # 头部特征: expression(50) + jaw_pose(3) + neck_pose(3) = 56维
+            expression_cuda = self.expression.cuda()
+            jaw_pose_cuda = self.jaw_pose.cuda()
+            
+            # 确保维度匹配 - expression和jaw_pose可能是2D的，需要squeeze到1D
+            if len(expression_cuda.shape) > 1:
+                expression_cuda = expression_cuda.squeeze()
+            if len(jaw_pose_cuda.shape) > 1:
+                jaw_pose_cuda = jaw_pose_cuda.squeeze()
+                
+            features = torch.cat([expression_cuda, jaw_pose_cuda, neck_pose])
+        elif feature_type == 'body':
+            # 身体特征: body_poses(63) + neck_pose(3) = 66维 (排除expression和jaw_pose)
+            features = torch.cat([body_features, neck_pose])
+        else:  # 'all'
+            # 全部特征: body(63) + expression(50) + jaw(3) = 116维 (更新后的兼容性)
+            expression_cuda = self.expression.cuda()
+            jaw_pose_cuda = self.jaw_pose.cuda()
+            
+            # 确保维度匹配 - expression和jaw_pose可能是2D的，需要squeeze到1D
+            if len(expression_cuda.shape) > 1:
+                expression_cuda = expression_cuda.squeeze()
+            if len(jaw_pose_cuda.shape) > 1:
+                jaw_pose_cuda = jaw_pose_cuda.squeeze()
+                
+            features = torch.cat([body_features, expression_cuda, jaw_pose_cuda])
 
         return features
 
@@ -363,13 +502,64 @@ class GaussianModel:
     @property
     def get_encoded_feature(self):
         if 'get_encoded_feature' in self.cache_dict: return self.cache_dict['get_encoded_feature']
-        features = self.get_joint_features
-        N_feat = len(self.encoder_feat_params['layers.0.weight'])
-        features = features.tile([N_feat, 1])
-        features = vmap_mlp(self.encoder_feat_params, features)
+        
+        if self.head_encoder_params is not None and self.body_encoder_params is not None:
+            # 分离模式：使用头部和身体编码器
+            head_features = self._get_joint_features_for_type('head')  # 16维
+            body_features = self._get_joint_features_for_type('body')  # 66维
+            
+            N_feat = len(self.head_encoder_params['layers.0.weight'])
+            
+            # 为头部和身体特征分别编码
+            head_features_tiled = head_features.tile([N_feat, 1])
+            body_features_tiled = body_features.tile([N_feat, 1])
+            
+            head_encoded = vmap_mlp(self.head_encoder_params, head_features_tiled)
+            body_encoded = vmap_mlp(self.body_encoder_params, body_features_tiled)
+            
+            # 根据Gaussian点的头部/身体mask来混合编码器输出
+            features = self._combine_head_body_features(head_encoded, body_encoded)
+        else:
+            # 兼容模式：使用原有的单一编码器
+            features = self.get_joint_features
+            N_feat = len(self.encoder_feat_params['layers.0.weight'])
+            features = features.tile([N_feat, 1])
+            features = vmap_mlp(self.encoder_feat_params, features)
 
         self.cache_dict['get_encoded_feature'] = features
         return features
+    
+    def _combine_head_body_features(self, head_encoded, body_encoded):
+        """根据Gaussian点的位置混合头部和身体编码特征"""
+        if self.head_gs_mask is None or self.body_gs_mask is None:
+            # 如果没有mask，默认使用身体编码器
+            return body_encoded
+        
+        # 检查维度兼容性    
+        N_feat_head, feat_dim_head = head_encoded.shape
+        N_feat_body, feat_dim_body = body_encoded.shape
+        
+        if feat_dim_head != feat_dim_body:
+            print(f"Warning: Head encoder output dim ({feat_dim_head}) != Body encoder output dim ({feat_dim_body})")
+            # 使用身体编码器作为基础，因为它的维度更大
+            return body_encoded
+            
+        # 获取每个Gaussian点对应的特征点索引
+        # nbr_gsft 存储了每个Gaussian点最近的特征点索引
+        N_gs, K_feat = self.nbr_gsft.shape  # [N_gaussians, K_neighbors]
+        
+        # 创建混合特征矩阵，基于身体编码器的维度
+        combined_features = body_encoded.clone()
+        
+        # 对于每个Gaussian点，根据其头部/身体属性选择对应的编码器输出
+        head_gaussian_indices = torch.where(self.head_gs_mask)[0]
+        
+        if len(head_gaussian_indices) > 0:
+            # 批量处理头部Gaussian点
+            head_feat_indices = self.nbr_gsft[head_gaussian_indices].flatten().unique()
+            combined_features[head_feat_indices] = head_encoded[head_feat_indices]
+        
+        return combined_features
 
     @property
     def get_encoded_feature_gsparam_weight(self):
@@ -493,7 +683,7 @@ class GaussianModel:
 
         return color
 
-    def create_from_pcd(self, xyz=None, t_joints=None, joint_parents=None, all_poses=None, lbs_weights_grid_info=None, xyz_vt=None, xyz_ft=None):
+    def create_from_pcd(self, xyz=None, t_joints=None, joint_parents=None, all_poses=None, lbs_weights_grid_info=None, xyz_vt=None, xyz_ft=None, head_face_indices=None):
         xyz = torch.as_tensor(xyz).float().cuda() # [N,3]
         N = xyz.shape[0]
         print("Number of points at initialization : ", N)
@@ -529,36 +719,93 @@ class GaussianModel:
         for key in ['grid', 'bbox_min', 'bbox_max', 'grid_dims']: ginfo[key] = torch.as_tensor(ginfo[key]).detach().cuda()
         self.weights_grid_info = ginfo
 
-        # Pose encoder - 扩展输入维度支持表情: body(63) + expression(10) + jaw(3) = 76
-        models = [MLP(layers_size_list=[76, 512, 256, 256, 256, self.num_basis+self.num_vt_basis]) for i in range(len(xyz_ft))]
-        params, _ = stack_module_state(models)
-        self.encoder_feat_model_meta = MLP(layers_size_list=[76, 512, 256, 256, 256, self.num_basis+self.num_vt_basis]).to('meta')
-        for k, v in params.items():
-            params[k] = nn.Parameter(v.cuda().requires_grad_(True))
-        self.encoder_feat_params = params
+        # Pose encoder - 支持头部和身体分离的编码器
+        if head_face_indices is not None:
+            # 创建分离的编码器：头部编码器(56维输入) 和 身体编码器(66维输入)
+            head_models = [MLP(layers_size_list=[56, 256, 128, 128, self.num_basis+self.num_vt_basis]) for i in range(len(xyz_ft))]
+            body_models = [MLP(layers_size_list=[66, 512, 256, 256, self.num_basis+self.num_vt_basis]) for i in range(len(xyz_ft))]
+            
+            head_params, _ = stack_module_state(head_models)
+            body_params, _ = stack_module_state(body_models)
+            
+            # 创建meta模型
+            self.head_encoder_model_meta = MLP(layers_size_list=[56, 256, 128, 128, self.num_basis+self.num_vt_basis]).to('meta')
+            self.body_encoder_model_meta = MLP(layers_size_list=[66, 512, 256, 256, self.num_basis+self.num_vt_basis]).to('meta')
+            
+            # 设置参数
+            for k, v in head_params.items():
+                head_params[k] = nn.Parameter(v.cuda().requires_grad_(True))
+            for k, v in body_params.items():
+                body_params[k] = nn.Parameter(v.cuda().requires_grad_(True))
+                
+            self.head_encoder_params = head_params
+            self.body_encoder_params = body_params
+            
+            # 保持原有编码器为None表示使用分离模式
+            self.encoder_feat_params = None
+            self.encoder_feat_model_meta = None
+        else:
+            # 兼容原有模式：单一编码器 body(63) + expression(50) + jaw(3) = 116
+            models = [MLP(layers_size_list=[116, 512, 256, 256, 256, self.num_basis+self.num_vt_basis]) for i in range(len(xyz_ft))]
+            params, _ = stack_module_state(models)
+            self.encoder_feat_model_meta = MLP(layers_size_list=[116, 512, 256, 256, 256, self.num_basis+self.num_vt_basis]).to('meta')
+            for k, v in params.items():
+                params[k] = nn.Parameter(v.cuda().requires_grad_(True))
+            self.encoder_feat_params = params
+            
+            # 分离模式参数设为None
+            self.head_encoder_params = None
+            self.body_encoder_params = None
+            self.head_encoder_model_meta = None
+            self.body_encoder_model_meta = None
 
-        # basis
-        dxyz_bs = torch.zeros((len(xyz_vt), self.num_vt_basis, 3)).float().cuda()
-        sh0_bs = torch.zeros((N, self.num_basis, 1, 3)).float().cuda()
-        shN_bs = torch.zeros((N, self.num_basis, 3, 3)).float().cuda()
-        scaling_bs = torch.zeros((N, self.num_basis, 3)).float().cuda()
-        rotation_bs = torch.zeros((N, self.num_basis, 4)).float().cuda()
-        opacity_bs = torch.zeros((N, self.num_basis)).float().cuda()
-        for data in [dxyz_bs, sh0_bs, scaling_bs, rotation_bs, opacity_bs]:
-            nn.init.uniform_(data[0], -0.002, 0.002)
-            data[1:] = data[0]
-        self.dxyz_bs = nn.Parameter(dxyz_bs.requires_grad_(True))
-        self.sh0_bs = nn.Parameter(sh0_bs.requires_grad_(True))
-        self.shN_bs = nn.Parameter(shN_bs.requires_grad_(True))
-        self.scaling_bs = nn.Parameter(scaling_bs.requires_grad_(True))
-        self.rotation_bs = nn.Parameter(rotation_bs.requires_grad_(True))
-        self.opacity_bs = nn.Parameter(opacity_bs.requires_grad_(True))
+        # basis - 根据编码器模式设置不同的维度
+        # 在头部-身体分离模式下，我们需要禁用basis功能避免维度不匹配
+        # 因为头部和身体编码器输出维度不同，无法使用统一的basis矩阵
+        if head_face_indices is not None:
+            # 头部-身体分离模式：禁用basis功能
+            dxyz_bs = torch.zeros((len(xyz_vt), self.num_vt_basis, 3)).float().cuda()
+            sh0_bs = torch.zeros((N, self.num_basis, 1, 3)).float().cuda()
+            shN_bs = torch.zeros((N, self.num_basis, 3, 3)).float().cuda()
+            scaling_bs = torch.zeros((N, self.num_basis, 3)).float().cuda()
+            rotation_bs = torch.zeros((N, self.num_basis, 4)).float().cuda()
+            opacity_bs = torch.zeros((N, self.num_basis)).float().cuda()
+            
+            # 初始化为零，不使用basis功能
+            self.dxyz_bs = nn.Parameter(dxyz_bs.requires_grad_(False))  # 禁用梯度
+            self.sh0_bs = nn.Parameter(sh0_bs.requires_grad_(False))
+            self.shN_bs = nn.Parameter(shN_bs.requires_grad_(False))  
+            self.scaling_bs = nn.Parameter(scaling_bs.requires_grad_(False))
+            self.rotation_bs = nn.Parameter(rotation_bs.requires_grad_(False))
+            self.opacity_bs = nn.Parameter(opacity_bs.requires_grad_(False))
+        else:
+            # 原有兼容模式：正常使用basis功能
+            dxyz_bs = torch.zeros((len(xyz_vt), self.num_vt_basis, 3)).float().cuda()
+            sh0_bs = torch.zeros((N, self.num_basis, 1, 3)).float().cuda()
+            shN_bs = torch.zeros((N, self.num_basis, 3, 3)).float().cuda()
+            scaling_bs = torch.zeros((N, self.num_basis, 3)).float().cuda()
+            rotation_bs = torch.zeros((N, self.num_basis, 4)).float().cuda()
+            opacity_bs = torch.zeros((N, self.num_basis)).float().cuda()
+            for data in [dxyz_bs, sh0_bs, scaling_bs, rotation_bs, opacity_bs]:
+                nn.init.uniform_(data[0], -0.002, 0.002)
+                data[1:] = data[0]
+            self.dxyz_bs = nn.Parameter(dxyz_bs.requires_grad_(True))
+            self.sh0_bs = nn.Parameter(sh0_bs.requires_grad_(True))
+            self.shN_bs = nn.Parameter(shN_bs.requires_grad_(True))
+            self.scaling_bs = nn.Parameter(scaling_bs.requires_grad_(True))
+            self.rotation_bs = nn.Parameter(rotation_bs.requires_grad_(True))
+            self.opacity_bs = nn.Parameter(opacity_bs.requires_grad_(True))
 
         xyz_ft = torch.as_tensor(xyz_ft).float().cuda()
         xyz_vt = torch.as_tensor(xyz_vt).float().cuda()
         self.dxyz_vt = nn.Parameter(torch.zeros_like(xyz_vt).float().cuda().requires_grad_(True))
 
         self.prepare_interpolating_weights(xyz_ft, xyz_vt)
+        
+        # 初始化头部-身体分离
+        if head_face_indices is not None:
+            self.head_face_indices = head_face_indices
+            self._initialize_head_body_separation()
 
         self.init()
 
@@ -574,18 +821,31 @@ class GaussianModel:
             'opacities': Adam([self._opacity], args.opacity_lr, betas, eps),
             'sh0': Adam([self._sh0], args.color_lr, betas, eps),
             'shN': Adam([self._shN], args.color_lr / 20, betas, eps),
-
-            'dxyz_bs': Adam([self.dxyz_bs], args.position_lr * scene_scale / 10, betas, eps),
-            'dscales_bs': Adam([self.scaling_bs], args.scaling_lr / 5, betas, eps),
-            'dquats_bs': Adam([self.rotation_bs], args.rotation_lr / 5, betas, eps),
-            'dopacities_bs': Adam([self.opacity_bs], args.opacity_lr / 5, betas, eps),
-            'dsh0_bs': Adam([self.sh0_bs], args.color_lr / 5, betas, eps),
-            'dshN_bs': Adam([self.shN_bs], args.color_lr / 200, betas, eps),
-
-            'encoder_feat_params': AdamW(self.encoder_feat_params.values(), args.encoder_lr, betas, eps, decay),
-
             'xyz_offset': Adam([self.xyz_offset], args.xyz_offset_lr, betas, eps),
         }
+        
+        # 只在非头部-身体分离模式下添加basis优化器
+        if self.head_encoder_params is None and self.body_encoder_params is None:
+            # 兼容模式：添加basis优化器
+            optimizers.update({
+                'dxyz_bs': Adam([self.dxyz_bs], args.position_lr * scene_scale / 10, betas, eps),
+                'dscales_bs': Adam([self.scaling_bs], args.scaling_lr / 5, betas, eps),
+                'dquats_bs': Adam([self.rotation_bs], args.rotation_lr / 5, betas, eps),
+                'dopacities_bs': Adam([self.opacity_bs], args.opacity_lr / 5, betas, eps),
+                'dsh0_bs': Adam([self.sh0_bs], args.color_lr / 5, betas, eps),
+                'dshN_bs': Adam([self.shN_bs], args.color_lr / 200, betas, eps),
+            })
+
+        # 添加编码器优化器
+        if self.encoder_feat_params is not None:
+            # 兼容模式：原有的单一编码器
+            optimizers['encoder_feat_params'] = AdamW(self.encoder_feat_params.values(), args.encoder_lr, betas, eps, decay)
+        else:
+            # 分离模式：头部和身体编码器
+            if self.head_encoder_params is not None:
+                optimizers['head_encoder_params'] = AdamW(self.head_encoder_params.values(), args.encoder_lr, betas, eps, decay)
+            if self.body_encoder_params is not None:
+                optimizers['body_encoder_params'] = AdamW(self.body_encoder_params.values(), args.encoder_lr, betas, eps, decay)
 
         schedulers = [
             ExponentialLR(optimizers['dxyz'], gamma=0.01 ** (1.0 / args.iterations)),
@@ -594,12 +854,21 @@ class GaussianModel:
             ExponentialLR(optimizers['opacities'], gamma=0.1 ** (1.0 / args.iterations)),
             ExponentialLR(optimizers['sh0'], gamma=0.1 ** (1.0 / args.iterations)),
             ExponentialLR(optimizers['shN'], gamma=0.1 ** (1.0 / args.iterations)),
-
-            ExponentialLR(optimizers['dxyz_bs'], gamma=0.1 ** (1.0 / args.iterations)),
-            ExponentialLR(optimizers['encoder_feat_params'], gamma=0.1 ** (1.0 / args.iterations)),
-
             ExponentialLR(optimizers['xyz_offset'], gamma=0.1 ** (1.0 / args.iterations)),
         ]
+        
+        # 只在非头部-身体分离模式下添加basis调度器
+        if self.head_encoder_params is None and self.body_encoder_params is None:
+            # 兼容模式：添加basis调度器
+            schedulers.append(ExponentialLR(optimizers['dxyz_bs'], gamma=0.1 ** (1.0 / args.iterations)))
+
+        # 添加编码器调度器
+        if 'encoder_feat_params' in optimizers:
+            schedulers.append(ExponentialLR(optimizers['encoder_feat_params'], gamma=0.1 ** (1.0 / args.iterations)))
+        if 'head_encoder_params' in optimizers:
+            schedulers.append(ExponentialLR(optimizers['head_encoder_params'], gamma=0.1 ** (1.0 / args.iterations)))
+        if 'body_encoder_params' in optimizers:
+            schedulers.append(ExponentialLR(optimizers['body_encoder_params'], gamma=0.1 ** (1.0 / args.iterations)))
 
         self.optimizers = optimizers
         self.schedulers = schedulers

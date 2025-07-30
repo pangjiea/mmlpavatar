@@ -28,7 +28,7 @@ from scene.dataset import data_to_cam
 from scene.net_vis import Visualizer
 from utils.config_utils import Config
 from utils.general_utils import safe_state
-from utils.loss_utils import l1_loss, psnr, lpips_loss, dxyz_smooth_loss, gaussian_scaling_loss
+from utils.loss_utils import l1_loss, psnr, lpips_loss, dxyz_smooth_loss, gaussian_scaling_loss, head_body_separation_loss, head_consistency_loss
 from utils.image_utils import crop_image
 
 def training(args: Config):
@@ -86,7 +86,39 @@ def training(args: Config):
 
         scaling_loss = args.lambda_scaling * gaussian_scaling_loss(gaussians.get_cano_scaling, args.scaling_threshold)
 
-        loss = l1loss + lpipsloss + dxyzsmoothloss + scaling_loss
+        # 头部身体分离损失
+        head_body_loss = torch.tensor(0.0, device='cuda')
+        head_body_loss_dict = {}
+        head_consistency_loss_val = torch.tensor(0.0, device='cuda')
+        
+        # 保存头部mask可视化（训练监控）
+        if iteration % 2000 == 0 or (iteration < 100 and iteration % 20 == 0):
+            try:
+                from utils.head_mask_monitor import save_training_head_mask_sample
+                debug_dir = os.path.join(args.out_dir, "debug_head_masks")
+                save_training_head_mask_sample(cam, gaussians, iteration, debug_dir)
+            except Exception as e:
+                print(f"Debug: Failed to save head mask sample: {e}")
+        
+        if iteration > args.iteration_head_body_loss:
+            # 计算头部身体分离损失
+            separation_loss, separation_loss_dict = head_body_separation_loss(
+                gaussians, 
+                alpha=args.lambda_head_body_feature_diff,
+                beta=args.lambda_head_body_spatial_sep
+            )
+            head_body_loss = separation_loss * args.lambda_head_body_separation
+            head_body_loss_dict = separation_loss_dict
+            
+            # 计算头部一致性损失 (如果有头部mask)
+            if 'head_mask' in cam:
+                head_consistency_loss_val = head_consistency_loss(
+                    gaussians, 
+                    cam['head_mask'],
+                    gamma=args.lambda_head_consistency
+                )
+
+        loss = l1loss + lpipsloss + dxyzsmoothloss + scaling_loss + head_body_loss + head_consistency_loss_val
 
         loss.backward()
 
@@ -102,19 +134,33 @@ def training(args: Config):
             gaussians.sh_degree += 1
             print(f'SH degree: {gaussians.sh_degree}')
 
-        loss_dict = dict(l1_loss=l1loss, lpips_loss=lpipsloss, dxyzsmooth_loss=dxyzsmoothloss, scaling_loss=scaling_loss)
+        loss_dict = dict(l1_loss=l1loss, lpips_loss=lpipsloss, dxyzsmooth_loss=dxyzsmoothloss, scaling_loss=scaling_loss, 
+                         head_body_loss=head_body_loss, head_consistency_loss=head_consistency_loss_val)
+        
+        # 添加详细的头部身体分离损失项
+        for key, value in head_body_loss_dict.items():
+            loss_dict[f'head_body_{key}'] = value * args.lambda_head_body_separation
         training_report(scene, gaussians, iteration, args.test_iterations, loss_dict, background)
 
         # optimizer step
         gaussians.optimizer_step()
 
+        # basis启用逻辑 - 在头部-身体分离模式下禁用
         if iteration == args.iteration_dxyz_basis:
-            gaussians.is_dxyz_bs = True
-            print(f'[ITER {iteration}] Control point basis')
+            if gaussians.head_encoder_params is None and gaussians.body_encoder_params is None:
+                # 只在兼容模式下启用dxyz basis
+                gaussians.is_dxyz_bs = True
+                print(f'[ITER {iteration}] Control point basis')
+            else:
+                print(f'[ITER {iteration}] Control point basis disabled in head-body separation mode')
 
         if iteration == args.iteration_gsparam_basis:
-            gaussians.is_gsparam_bs = True
-            print(f'[ITER {iteration}] Gaussian property basis')
+            if gaussians.head_encoder_params is None and gaussians.body_encoder_params is None:
+                # 只在兼容模式下启用gsparam basis
+                gaussians.is_gsparam_bs = True
+                print(f'[ITER {iteration}] Gaussian property basis')
+            else:
+                print(f'[ITER {iteration}] Gaussian property basis disabled in head-body separation mode')
 
         # checkpoint
         if iteration in args.checkpoint_iterations:
@@ -151,7 +197,7 @@ def training_report(scene: Scene, gaussians: GaussianModel, iteration, test_iter
             dataset=scene.testset,
             batch_size=1,
             shuffle=False,
-            num_workers=8,
+            num_workers=8,  # 恢复多进程加速
             pin_memory=True,
         )
 

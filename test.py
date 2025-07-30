@@ -65,7 +65,10 @@ def load_amass_pose_list(pose_path):
         trans[win_size: frame_num-win_size] /= (2 * win_size + 1)
 
     for i in range(N):
-        pose_list.append(dict(pose=poses[i], Th=trans[i], Rh=np.eye(3, dtype=np.float32)))
+        expression = np.zeros(50, dtype=np.float32)  # SMPL-X标准expression维度
+        jaw_pose = np.zeros(3, dtype=np.float32)   # AMASS没有jaw_pose数据
+        pose_list.append(dict(pose=poses[i], Th=trans[i], Rh=np.eye(3, dtype=np.float32),
+                             expression=expression, jaw_pose=jaw_pose))
 
     return pose_list
 
@@ -84,7 +87,17 @@ def load_thuman_pose_list(pose_path):
                     smpl_params['right_hand_pose'][frame_id],], axis=0)
         Th = smpl_params['transl'][frame_id]
         Rh = np.eye(3, dtype=np.float32)
-        pose_list.append(dict(pose=pose, Th=Th, Rh=Rh))
+        
+        # 添加expression和jaw_pose支持
+        expression = smpl_params.get('expression', np.zeros(50, dtype=np.float32))
+        jaw_pose = smpl_params.get('jaw_pose', np.zeros(3, dtype=np.float32))
+        
+        if len(expression.shape) > 1:
+            expression = expression[frame_id]
+        if len(jaw_pose.shape) > 1:
+            jaw_pose = jaw_pose[frame_id]
+            
+        pose_list.append(dict(pose=pose, Th=Th, Rh=Rh, expression=expression, jaw_pose=jaw_pose))
     return pose_list
 
 def testing_novel_cam_pose_speed(gaussians: GaussianModel, out_dir, frame_ids, pose_list, cam, background):
@@ -94,6 +107,8 @@ def testing_novel_cam_pose_speed(gaussians: GaussianModel, out_dir, frame_ids, p
     gaussians.smpl_poses = torch.as_tensor(pose['pose'])
     gaussians.Th = torch.as_tensor(pose['Th'])
     gaussians.Rh = torch.as_tensor(pose['Rh'])
+    gaussians.expression = torch.as_tensor(pose.get('expression', np.zeros(50, dtype=np.float32)))
+    gaussians.jaw_pose = torch.as_tensor(pose.get('jaw_pose', np.zeros(3, dtype=np.float32)))
     image, alpha, info = gaussians.render(cam, background=background)
     torch.cuda.synchronize()
 
@@ -107,6 +122,8 @@ def testing_novel_cam_pose_speed(gaussians: GaussianModel, out_dir, frame_ids, p
         gaussians.smpl_poses = torch.as_tensor(pose['pose'])
         gaussians.Th = torch.as_tensor(pose['Th'])
         gaussians.Rh = torch.as_tensor(pose['Rh'])
+        gaussians.expression = torch.as_tensor(pose.get('expression', np.zeros(50, dtype=np.float32)))
+        gaussians.jaw_pose = torch.as_tensor(pose.get('jaw_pose', np.zeros(3, dtype=np.float32)))
 
         image, alpha, info = gaussians.render(cam, background=background)
 
@@ -131,6 +148,8 @@ def testing_novel_cam_pose(gaussians: GaussianModel, out_dir, frame_ids, pose_li
         gaussians.smpl_poses = torch.as_tensor(pose['pose']).cpu()
         gaussians.Th = torch.clone(torch.as_tensor(pose['Th']).cpu())
         gaussians.Rh = torch.as_tensor(pose['Rh']).cpu()
+        gaussians.expression = torch.as_tensor(pose.get('expression', np.zeros(50, dtype=np.float32)))
+        gaussians.jaw_pose = torch.as_tensor(pose.get('jaw_pose', np.zeros(3, dtype=np.float32)))
         image, alpha, info = gaussians.render(cam, background=background)
 
         image = (torch.clamp(image, min=0, max=1.0) * 255).byte().contiguous().cpu().numpy()
@@ -154,6 +173,8 @@ def testing_dataset(gaussians: GaussianModel, out_dir, dataset, background):
         frame_id = cam['frame_id']
         gaussians.smpl_poses = cam['pose']
         gaussians.Th, gaussians.Rh = cam['Th'], cam['Rh']
+        gaussians.expression = cam.get('expression', torch.zeros(10, dtype=torch.float32))
+        gaussians.jaw_pose = cam.get('jaw_pose', torch.zeros(3, dtype=torch.float32))
 
         image, alpha, info = gaussians.render(cam, background=background)
 

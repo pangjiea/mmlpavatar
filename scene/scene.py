@@ -57,7 +57,7 @@ class Scene:
             dataset=trainset,
             batch_size=1,
             shuffle=True,
-            num_workers=8,
+            num_workers=8,  # 恢复多进程加速
             persistent_workers=False,
             pin_memory=True,
         )
