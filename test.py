@@ -32,8 +32,23 @@ def fovx_to_intrinsic(fovx, H, W):
     K[0, 2], K[1, 2] = W/2, H/2
     return K.astype(np.float32)
 
+def load_json_pose_list(pose_path):
+    """Load pose list from JSON file"""
+    with open(pose_path, 'r') as f:
+        pose_data = json.load(f)
+    
+    pose_list = []
+    for frame_data in pose_data:
+        pose_list.append({
+            'pose': np.array(frame_data['pose'], dtype=np.float32),
+            'Th': np.array(frame_data['Th'], dtype=np.float32),
+            'Rh': np.array(frame_data['Rh'], dtype=np.float32)
+        })
+    
+    return pose_list
+
 def load_amass_pose_list(pose_path):
-    data = np.load(pose_path)
+    data = np.load(pose_path, allow_pickle=True)
     pose_list = []
     poses = data['poses'].astype(np.float32)
     trans = data['trans'].astype(np.float32)
@@ -136,6 +151,33 @@ def testing_novel_cam_pose(gaussians: GaussianModel, out_dir, frame_ids, pose_li
         image = (torch.clamp(image, min=0, max=1.0) * 255).byte().contiguous().cpu().numpy()
         iio.imwrite(path.join(out_dir, f'{frame_id:08d}.png'), image)
 
+def testing_360frame_novel_view(gaussians: GaussianModel, out_dir, frame_ids, pose_list, cam_trajectory, background):
+    """Test with 360-frame novel view generation using camera trajectory"""
+    
+    os.makedirs(path.join(out_dir), exist_ok=True)
+    
+    print(f"Generating {len(frame_ids)} frames with {len(cam_trajectory)} camera poses...")
+    
+    for frame_id in tqdm(frame_ids):
+        # Get pose for this frame
+        pose = pose_list[frame_id % len(pose_list)]  # Cycle through poses if needed
+        pose = copy.deepcopy(pose)
+        
+        # Get camera for this frame (cycle through camera trajectory)
+        cam_idx = frame_id % len(cam_trajectory)
+        cam = cam_trajectory[cam_idx]
+        
+        # Set SMPL parameters
+        gaussians.smpl_poses = torch.as_tensor(pose['pose']).cpu()
+        gaussians.Th = torch.clone(torch.as_tensor(pose['Th']).cpu())
+        gaussians.Rh = torch.as_tensor(pose['Rh']).cpu()
+        
+        # Render image
+        image, alpha, info = gaussians.render(cam, background=background)
+        
+        image = (torch.clamp(image, min=0, max=1.0) * 255).byte().contiguous().cpu().numpy()
+        iio.imwrite(path.join(out_dir, f'{frame_id:08d}.png'), image)
+
 
 def testing_dataset(gaussians: GaussianModel, out_dir, dataset, background):
     test_dataloader = DataLoader(
@@ -179,25 +221,60 @@ def testing(args: Config):
     background = torch.as_tensor(np.array(args.background)).float().cuda()
 
     # Dataset
-    test_frame_ids = np.arange(args.test.begin_ith_frame, args.test.begin_ith_frame+args.test.frame_interval*args.test.num_frame, args.test.frame_interval).tolist()
+    if pargs.num_frames != 360:
+        # Use custom number of frames for 360-view generation
+        test_frame_ids = np.arange(pargs.num_frames).tolist()
+    else:
+        test_frame_ids = np.arange(args.test.begin_ith_frame, args.test.begin_ith_frame+args.test.frame_interval*args.test.num_frame, args.test.frame_interval).tolist()
     test_cam_ids = np.array(args.test.cam_ids).tolist()
 
     if args.test.cam_path is not None and args.test.pose_path is not None:
-        with open(args.test.cam_path, 'r') as file:
-            cam = json.load(file)
-        cam['w2c'] = torch.as_tensor(np.array(cam['w2c']).reshape(4,4)).float().cuda()
-        K = fovx_to_intrinsic(cam['fovx'] / 180 * np.pi, cam['height'], cam['width'])
-        cam['K'] = torch.as_tensor(K).cuda()
+        # Check if this is a camera trajectory (list of cameras) or single camera
+        try:
+            with open(args.test.cam_path, 'r') as file:
+                cam_data = json.load(file)
+            
+            if isinstance(cam_data, list):
+                # Camera trajectory - multiple cameras
+                cam_trajectory = []
+                for cam_json in cam_data:
+                    cam = {
+                        'w2c': torch.as_tensor(np.array(cam_json['w2c']).reshape(4,4)).float().cuda(),
+                        'K': torch.as_tensor(fovx_to_intrinsic(cam_json['fovx'] / 180 * np.pi, cam_json['height'], cam_json['width'])).cuda(),
+                        'height': cam_json['height'],
+                        'width': cam_json['width']
+                    }
+                    cam_trajectory.append(cam)
+                print(f"Loaded camera trajectory with {len(cam_trajectory)} cameras")
+            else:
+                # Single camera
+                cam_trajectory = [{
+                    'w2c': torch.as_tensor(np.array(cam_data['w2c']).reshape(4,4)).float().cuda(),
+                    'K': torch.as_tensor(fovx_to_intrinsic(cam_data['fovx'] / 180 * np.pi, cam_data['height'], cam_data['width'])).cuda(),
+                    'height': cam_data['height'],
+                    'width': cam_data['width']
+                }]
+                print("Loaded single camera")
+        except Exception as e:
+            print(f"Error loading camera data: {e}")
+            return
 
         if 'smpl_params.npz' in args.test.pose_path:
             pose_list = load_thuman_pose_list(args.test.pose_path)
+        elif args.test.pose_path.endswith('.json'):
+            pose_list = load_json_pose_list(args.test.pose_path)
         else:
             pose_list = load_amass_pose_list(args.test.pose_path)
 
         if args.test.test_speed:
-            testing_novel_cam_pose_speed(gaussians, args.out_dir, test_frame_ids, pose_list, cam, background)
+            testing_novel_cam_pose_speed(gaussians, args.out_dir, test_frame_ids, pose_list, cam_trajectory[0], background)
         else:
-            testing_novel_cam_pose(gaussians, args.out_dir, test_frame_ids, pose_list, cam, background)
+            if len(cam_trajectory) > 1:
+                # Use 360-frame novel view generation for camera trajectories
+                testing_360frame_novel_view(gaussians, args.out_dir, test_frame_ids, pose_list, cam_trajectory, background)
+            else:
+                # Use single camera mode
+                testing_novel_cam_pose(gaussians, args.out_dir, test_frame_ids, pose_list, cam_trajectory[0], background)
     else:
         DatasetType = get_dataset_type(args.data_dir)
         testset = DatasetType(
@@ -222,6 +299,7 @@ if __name__ == "__main__":
     parser.add_argument('--pose_path', type=str, default=None)
     parser.add_argument('--test', action='store_true')
     parser.add_argument('--test_speed', action='store_true')
+    parser.add_argument('--num_frames', type=int, default=360, help='Number of frames to generate for 360-view')
     pargs = parser.parse_args(sys.argv[1:])
 
     args = OmegaConf.load(pargs.config)
