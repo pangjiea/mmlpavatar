@@ -87,6 +87,28 @@ def load_thuman_pose_list(pose_path):
         pose_list.append(dict(pose=pose, Th=Th, Rh=Rh))
     return pose_list
 
+def load_smpl_params_with_rhth(pose_path):
+    """Load SMPL parameters with proper Rh and Th handling (reference dataset.py)"""
+    smpl_params = np.load(pose_path, allow_pickle=True)
+    smpl_params = dict(smpl_params)
+
+    pose_list = []
+    # Use Rh length as frame count (like dataset.py line 140)
+    N = len(smpl_params['Rh'])
+    for frame_id in range(N):
+        # Set global_orient to zero (like dataset.py line 145)
+        pose = np.concatenate([np.zeros(3, dtype=np.float32),
+                    smpl_params['body_pose'][frame_id],
+                    np.zeros(3, dtype=np.float32),
+                    np.zeros(6, dtype=np.float32),
+                    smpl_params['left_hand_pose'][frame_id],
+                    smpl_params['right_hand_pose'][frame_id],], axis=0)
+        # Use Th and Rh directly from smpl_params (like dataset.py lines 151-152)
+        Th = smpl_params['Th'][frame_id]
+        Rh = smpl_params['Rh'][frame_id]
+        pose_list.append(dict(pose=pose, Th=Th, Rh=Rh))
+    return pose_list
+
 def testing_novel_cam_pose_speed(gaussians: GaussianModel, out_dir, frame_ids, pose_list, cam, background):
 
     # warm up
@@ -189,7 +211,9 @@ def testing(args: Config):
         K = fovx_to_intrinsic(cam['fovx'] / 180 * np.pi, cam['height'], cam['width'])
         cam['K'] = torch.as_tensor(K).cuda()
 
-        if 'smpl_params.npz' in args.test.pose_path:
+        if 'replaced_zzr_sq02_action' in args.test.pose_path:
+            pose_list = load_smpl_params_with_rhth(args.test.pose_path)
+        elif 'smpl_params.npz' in args.test.pose_path:
             pose_list = load_thuman_pose_list(args.test.pose_path)
         else:
             pose_list = load_amass_pose_list(args.test.pose_path)
