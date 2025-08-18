@@ -137,19 +137,48 @@ class AVRexDataset:
         smpl_params = np.load(path.join(datadir, 'smpl_params.npz'), allow_pickle=True)
         smpl_params = dict(smpl_params)
 
-        N_frame = len(smpl_params['Rh'])
+        # 支持不同的数据集格式
+        if 'Rh' in smpl_params:
+            N_frame = len(smpl_params['Rh'])
+        elif 'Th' in smpl_params:
+            N_frame = len(smpl_params['Th'])
+        elif 'global_orient' in smpl_params:
+            N_frame = len(smpl_params['global_orient'])
+        else:
+            raise ValueError("无法确定帧数，SMPL参数文件中缺少Rh、Th或global_orient")
+        
         beta = smpl_params['betas'][0][:10]  # Only use first 10 shape parameters for SMPL-X
 
         pose_list, Th_list, Rh_list = [], [], []
-        for frame_id in range(N_frame):#这里globalorient归0 对于ali数据
-            pose = np.concatenate([torch.zeros(3).float(),
-                        smpl_params['body_pose'][frame_id],
-                        torch.zeros(3).float(),
-                        torch.zeros(6).float(),
-                        smpl_params['left_hand_pose'][frame_id],
-                        smpl_params['right_hand_pose'][frame_id],], axis=0)
-            Th = smpl_params['Th'][frame_id]
-            Rh = smpl_params['Rh'][frame_id]
+        for frame_id in range(N_frame):
+            # 使用真实的SMPL参数，而不是归零
+            global_orient = smpl_params['global_orient'][frame_id] if 'global_orient' in smpl_params else np.zeros(3)
+            jaw_pose = smpl_params['jaw_pose'][frame_id] if 'jaw_pose' in smpl_params else np.zeros(3)
+            expression = smpl_params['expression'][frame_id] if 'expression' in smpl_params else np.zeros(10)
+            
+            # 确保expression参数只使用前6维（MLP输入要求）
+            if len(expression) > 6:
+                expression = expression[:6]
+            
+            pose = np.concatenate([
+                global_orient,                              # global_orient (3维)
+                smpl_params['body_pose'][frame_id],        # body_pose (63维)
+                jaw_pose,                                   # jaw_pose (3维)
+                expression,                                 # expression (6维)
+                smpl_params['left_hand_pose'][frame_id],   # left_hand_pose (45维)
+                smpl_params['right_hand_pose'][frame_id],  # right_hand_pose (45维)
+            ], axis=0)
+            
+            # 处理不同的全局变换参数格式
+            if 'Th' in smpl_params:
+                Th = smpl_params['Th'][frame_id]
+            else:
+                Th = smpl_params['transl'][frame_id]
+                
+            if 'Rh' in smpl_params:
+                Rh = smpl_params['Rh'][frame_id]
+            else:
+                Rh = np.eye(3, dtype=np.float32)
 
             pose_list.append(pose)
             Th_list.append(Th)

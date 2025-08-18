@@ -108,7 +108,7 @@ class GaussianModel:
         self.all_poses = torch.empty(0)
         
         # facial parameters
-        self.expression = torch.zeros(10, dtype=torch.float32)
+        self.expression = torch.zeros(6, dtype=torch.float32)
         self.jaw_pose = torch.zeros(3, dtype=torch.float32)
 
         # cache
@@ -333,10 +333,10 @@ class GaussianModel:
             body_features = self.smpl_poses_cuda[3:3*22]  # 63维 body poses
 
         # 拼接表情和下颌参数
-        expression_cuda = self.expression.cuda()  # 10维
+        expression_cuda = self.expression.cuda()  # 6维
         jaw_pose_cuda = self.jaw_pose.cuda()      # 3维
         
-        # 组合成76维特征: body(63) + expression(10) + jaw(3)
+        # 组合成72维特征: body(63) + expression(6) + jaw(3)
         features = torch.cat([body_features, expression_cuda, jaw_pose_cuda])
 
         return features
@@ -529,10 +529,10 @@ class GaussianModel:
         for key in ['grid', 'bbox_min', 'bbox_max', 'grid_dims']: ginfo[key] = torch.as_tensor(ginfo[key]).detach().cuda()
         self.weights_grid_info = ginfo
 
-        # Pose encoder - 扩展输入维度支持表情: body(63) + expression(10) + jaw(3) = 76
-        models = [MLP(layers_size_list=[76, 512, 256, 256, 256, self.num_basis+self.num_vt_basis]) for i in range(len(xyz_ft))]
+        # Pose encoder - 扩展输入维度支持表情: body(63) + expression(6) + jaw(3) = 72
+        models = [MLP(layers_size_list=[72, 512, 256, 256, 256, self.num_basis+self.num_vt_basis]) for i in range(len(xyz_ft))]
         params, _ = stack_module_state(models)
-        self.encoder_feat_model_meta = MLP(layers_size_list=[76, 512, 256, 256, 256, self.num_basis+self.num_vt_basis]).to('meta')
+        self.encoder_feat_model_meta = MLP(layers_size_list=[72, 512, 256, 256, 256, self.num_basis+self.num_vt_basis]).to('meta')
         for k, v in params.items():
             params[k] = nn.Parameter(v.cuda().requires_grad_(True))
         self.encoder_feat_params = params
@@ -799,20 +799,54 @@ class GaussianModel:
         if 'pose' in smpl_data:
             # 格式1: 直接包含完整pose参数
             poses = smpl_data['pose']
+            # 检查pose参数的维度，如果是165维（旧格式），需要扩展以包含jaw_pose和expression
+            if poses.shape[1] == 165:
+                # 旧格式: [global_orient(3) + body_pose(63) + jaw_pose(3) + padding(6) + hands(90)]
+                # 新格式: [global_orient(3) + body_pose(63) + jaw_pose(3) + expression(6) + hands(90)]
+                new_poses = []
+                for i in range(len(poses)):
+                    pose = poses[i]
+                    # 提取各部分
+                    global_orient = pose[0:3]
+                    body_pose = pose[3:66]
+                    jaw_pose = pose[66:69]
+                    # padding = pose[69:75]  # 6维填充，丢弃
+                    left_hand_pose = pose[75:120]
+                    right_hand_pose = pose[120:165]
+                    # 使用默认expression（6维）
+                    expression = np.zeros(6, dtype=np.float32)
+                    
+                    # 重新组合为新格式
+                    new_pose = np.concatenate([
+                        global_orient, body_pose, jaw_pose, expression, 
+                        left_hand_pose, right_hand_pose
+                    ], axis=0)
+                    new_poses.append(new_pose)
+                poses = np.array(new_poses)
         elif 'global_orient' in smpl_data and 'body_pose' in smpl_data:
             # 格式2: 分离的参数，需要组合
             global_orient = smpl_data['global_orient']
             body_pose = smpl_data['body_pose']
             left_hand_pose = smpl_data.get('left_hand_pose', np.zeros((len(global_orient), 45)))
             right_hand_pose = smpl_data.get('right_hand_pose', np.zeros((len(global_orient), 45)))
+            jaw_pose = smpl_data.get('jaw_pose', np.zeros((len(global_orient), 3)))
+            expression = smpl_data.get('expression', np.zeros((len(global_orient), 10)))
 
-            # 组合为完整pose参数 [global_orient(3) + body_pose(63) + padding(9) + hands(90)] = 165维
+            # 组合为完整pose参数 [global_orient(3) + body_pose(63) + jaw_pose(3) + expression(10) + hands(90)] = 169维
             poses = []
             for i in range(len(global_orient)):
+                # 确保expression参数只使用前10维
+                expr = expression[i]
+                if len(expr) > 10:
+                    expr = expr[:10]
+                elif len(expr) < 10:
+                    expr = np.pad(expr, (0, 10 - len(expr)))
+                
                 pose = np.concatenate([
                     global_orient[i],           # 3维全局旋转
                     body_pose[i],              # 63维身体姿态
-                    np.zeros(9, dtype=np.float32),   # 9维填充
+                    jaw_pose[i],               # 3维下颌姿态
+                    expr,                      # 10维表情参数
                     left_hand_pose[i],         # 45维左手姿态
                     right_hand_pose[i],        # 45维右手姿态
                 ], axis=0)
@@ -827,7 +861,7 @@ class GaussianModel:
         # 表情参数
         expressions = smpl_data.get('expression', None)
         if expressions is not None:
-            expressions = expressions[:, :10]  # 只使用前10维
+            expressions = expressions[:, :6]  # 只使用前6维
 
         # 下颌参数
         jaw_poses = smpl_data.get('jaw_pose', None)
@@ -950,7 +984,7 @@ class GaussianModel:
             else:  # simple
                 self._save_simple_ply_to_path(output_path, color_mode)
 
-    def _save_standard_ply_to_path(self, output_path):
+    def _save_standard_ply_to_path(self, output_path):#？？
         """保存标准Gaussian Splatting格式的PLY文件到指定路径"""
         from plyfile import PlyData, PlyElement
 
@@ -997,7 +1031,7 @@ class GaussianModel:
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(output_path)
 
-    def _save_simple_ply_to_path(self, output_path, color_mode='sh'):
+    def _save_simple_ply_to_path(self, output_path, color_mode='sh'):#？？
         """保存简化点云格式的PLY文件到指定路径"""
         from utils.general_utils import storePly
 
