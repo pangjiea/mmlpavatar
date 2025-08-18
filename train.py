@@ -66,10 +66,12 @@ def training(args: Config):
 
         gaussians.smpl_poses = cam['pose']
         gaussians.Th, gaussians.Rh = cam['Th'], cam['Rh']
-        # 从gaussians.smpl_poses提取expression和jaw_pose
-        # pose结构: [global_orient(3) + body_pose(63) + jaw_pose(3) + expression(6) + left_hand_pose(45) + right_hand_pose(45)]
-        gaussians.expression = gaussians.smpl_poses[69:75]  # expression: 6维
+        # 从cam获取expression和从pose中提取jaw_pose、leye_pose、reye_pose
+        # pose结构: [global_orient(3) + body_pose(63) + jaw_pose(3) + leye_pose(3) + reye_pose(3) + left_hand_pose(45) + right_hand_pose(45)]
+        gaussians.expression = cam['expression']           # expression: 10维，单独在cam中
         gaussians.jaw_pose = gaussians.smpl_poses[66:69]    # jaw_pose: 3维
+        gaussians.leye_pose = gaussians.smpl_poses[69:72]   # leye_pose: 3维
+        gaussians.reye_pose = gaussians.smpl_poses[72:75]   # reye_pose: 3维
 
         image, alpha, info = gaussians.render(cam, background=bg)
         image = torch.clamp(image, 0, 1)
@@ -162,10 +164,12 @@ def training_report(scene: Scene, gaussians: GaussianModel, iteration, test_iter
             cam = data_to_cam(cam, non_blocking=False)
             gaussians.smpl_poses = cam['pose']
             gaussians.Th, gaussians.Rh = cam['Th'], cam['Rh']
-            # 从gaussians.smpl_poses提取expression和jaw_pose
-            # pose结构: [global_orient(3) + body_pose(63) + jaw_pose(3) + expression(6) + left_hand_pose(45) + right_hand_pose(45)]
-            gaussians.expression = gaussians.smpl_poses[69:75]  # expression: 6维
+            # 从cam获取expression和从pose中提取jaw_pose、leye_pose、reye_pose
+            # pose结构: [global_orient(3) + body_pose(63) + jaw_pose(3) + leye_pose(3) + reye_pose(3) + left_hand_pose(45) + right_hand_pose(45)]
+            gaussians.expression = cam['expression']           # expression: 10维，单独在cam中
             gaussians.jaw_pose = gaussians.smpl_poses[66:69]    # jaw_pose: 3维
+            gaussians.leye_pose = gaussians.smpl_poses[69:72]   # leye_pose: 3维
+            gaussians.reye_pose = gaussians.smpl_poses[72:75]   # reye_pose: 3维
 
             image, alpha, info = gaussians.render(cam, background=background)
             image = torch.clamp(image, 0, 1)

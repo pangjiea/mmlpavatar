@@ -19,7 +19,7 @@ def data_to_cam(data: dict, non_blocking=True):
     img_list = ['image', 'mask', 'mask_boundary']
     tensor_list = ['K', 'w2c']
     const_list = ['height', 'width', 'frame_id', 'cam_id', 'idx']
-    cpu_list = ['pose', 'beta', 'Rh', 'Th']
+    cpu_list = ['pose', 'beta', 'Rh', 'Th', 'expression']
     global stm
     if stm is None: stm = torch.cuda.Stream()
     for k, v in data.items():
@@ -149,22 +149,30 @@ class AVRexDataset:
         
         beta = smpl_params['betas'][0][:10]  # Only use first 10 shape parameters for SMPL-X
 
-        pose_list, Th_list, Rh_list = [], [], []
+        pose_list, Th_list, Rh_list, expression_list = [], [], [], []
         for frame_id in range(N_frame):
             # 使用真实的SMPL参数，而不是归零
             global_orient = smpl_params['global_orient'][frame_id] if 'global_orient' in smpl_params else np.zeros(3)
             jaw_pose = smpl_params['jaw_pose'][frame_id] if 'jaw_pose' in smpl_params else np.zeros(3)
             expression = smpl_params['expression'][frame_id] if 'expression' in smpl_params else np.zeros(10)
             
-            # 确保expression参数只使用前6维（MLP输入要求）
-            if len(expression) > 6:
-                expression = expression[:6]
+            # 6维用于左眼和右眼pose (leye_pose 3维 + reye_pose 3维)
+            leye_pose = smpl_params['leye_pose'][frame_id] if 'leye_pose' in smpl_params else np.zeros(3)
+            reye_pose = smpl_params['reye_pose'][frame_id] if 'reye_pose' in smpl_params else np.zeros(3)
+            expression = smpl_params['expression'][frame_id] if 'expression' in smpl_params else np.zeros(10)
+            
+            # 确保expression参数为10维
+            if len(expression) > 10:
+                expression = expression[:10]
+            elif len(expression) < 10:
+                expression = np.pad(expression, (0, 10 - len(expression)))
             
             pose = np.concatenate([
                 global_orient,                              # global_orient (3维)
                 smpl_params['body_pose'][frame_id],        # body_pose (63维)
                 jaw_pose,                                   # jaw_pose (3维)
-                expression,                                 # expression (6维)
+                leye_pose,                                  # leye_pose (3维)
+                reye_pose,                                  # reye_pose (3维)
                 smpl_params['left_hand_pose'][frame_id],   # left_hand_pose (45维)
                 smpl_params['right_hand_pose'][frame_id],  # right_hand_pose (45维)
             ], axis=0)
@@ -183,9 +191,11 @@ class AVRexDataset:
             pose_list.append(pose)
             Th_list.append(Th)
             Rh_list.append(Rh)
+            expression_list.append(expression)
 
         pose_data = dict(pose=np.array(pose_list).astype(np.float32), Th=np.array(Th_list).astype(np.float32),
-                         Rh=np.array(Rh_list).astype(np.float32), beta=beta.astype(np.float32))
+                         Rh=np.array(Rh_list).astype(np.float32), beta=beta.astype(np.float32), 
+                         expression=np.array(expression_list).astype(np.float32))
         return pose_data
 
     @staticmethod
@@ -209,8 +219,8 @@ class AVRexDataset:
 
         frame_id, cam_id = self.indices[idx]
 
-        pose, Rh, Th, beta = self.smpl_params['pose'][frame_id], self.smpl_params['Rh'][frame_id], \
-            self.smpl_params['Th'][frame_id], self.smpl_params['beta']
+        pose, Rh, Th, beta, expression = self.smpl_params['pose'][frame_id], self.smpl_params['Rh'][frame_id], \
+            self.smpl_params['Th'][frame_id], self.smpl_params['beta'], self.smpl_params['expression'][frame_id]
 
         # Load camera
         K, D, w2c = self.annots[cam_id]['K'], self.annots[cam_id]['D'], self.annots[cam_id]['w2c']
@@ -242,6 +252,7 @@ class AVRexDataset:
             'Rh': torch.from_numpy(Rh).float(),
             'Th': torch.from_numpy(Th).float(),
             'beta': torch.from_numpy(beta).float(),
+            'expression': torch.from_numpy(expression).float(),
             'height': image.shape[0],
             'width': image.shape[1],
             'frame_id': frame_id,
@@ -306,8 +317,8 @@ class ThumanDataset:
 
         frame_id, cam_id = self.indices[idx]
 
-        pose, Rh, Th, beta = self.smpl_params['pose'][frame_id], self.smpl_params['Rh'][frame_id], \
-            self.smpl_params['Th'][frame_id], self.smpl_params['beta']
+        pose, Rh, Th, beta, expression = self.smpl_params['pose'][frame_id], self.smpl_params['Rh'][frame_id], \
+            self.smpl_params['Th'][frame_id], self.smpl_params['beta'], self.smpl_params['expression'][frame_id]
 
         # Load camera
         K, D, w2c = self.annots[cam_id]['K'], self.annots[cam_id]['D'], self.annots[cam_id]['w2c']
@@ -339,6 +350,7 @@ class ThumanDataset:
             'Rh': torch.from_numpy(Rh).float(),
             'Th': torch.from_numpy(Th).float(),
             'beta': torch.from_numpy(beta).float(),
+            'expression': torch.from_numpy(expression).float(),
             'height': image.shape[0],
             'width': image.shape[1],
             'frame_id': frame_id,
@@ -449,8 +461,8 @@ class ActorsHQDataset:
 
         frame_id, cam_id = self.indices[idx]
 
-        pose, Rh, Th, beta = self.smpl_params['pose'][frame_id], self.smpl_params['Rh'][frame_id], \
-            self.smpl_params['Th'][frame_id], self.smpl_params['beta']
+        pose, Rh, Th, beta, expression = self.smpl_params['pose'][frame_id], self.smpl_params['Rh'][frame_id], \
+            self.smpl_params['Th'][frame_id], self.smpl_params['beta'], self.smpl_params['expression'][frame_id]
 
         # Load camera
         K, D, w2c = self.annots[cam_id]['K'], self.annots[cam_id]['D'], self.annots[cam_id]['w2c']
@@ -480,6 +492,7 @@ class ActorsHQDataset:
             'Rh': torch.from_numpy(Rh).float(),
             'Th': torch.from_numpy(Th).float(),
             'beta': torch.from_numpy(beta).float(),
+            'expression': torch.from_numpy(expression).float(),
             'height': image.shape[0],
             'width': image.shape[1],
             'frame_id': frame_id,
