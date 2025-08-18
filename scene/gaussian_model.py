@@ -785,7 +785,6 @@ class GaussianModel:
         self.nbr_vtft = nbr_gs
         self.nbr_vtft_wght = nbr_gs_wght
 
-<<<<<<< HEAD
     def save_gaussian_sequence_to_ply(self, smpl_params_path, output_dir, frame_start=0, frame_end=None, frame_step=1, format_type='standard'):
         """
         保存Gaussian点的全局坐标序列为PLY文件
