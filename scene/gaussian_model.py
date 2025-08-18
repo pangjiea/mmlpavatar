@@ -108,8 +108,10 @@ class GaussianModel:
         self.all_poses = torch.empty(0)
         
         # facial parameters
-        self.expression = torch.zeros(6, dtype=torch.float32)
+        self.expression = torch.zeros(10, dtype=torch.float32)
         self.jaw_pose = torch.zeros(3, dtype=torch.float32)
+        self.leye_pose = torch.zeros(3, dtype=torch.float32)
+        self.reye_pose = torch.zeros(3, dtype=torch.float32)
 
         # cache
         self.cache_dict = {}
@@ -333,11 +335,20 @@ class GaussianModel:
             body_features = self.smpl_poses_cuda[3:3*22]  # 63维 body poses
 
         # 拼接表情和下颌参数
-        expression_cuda = self.expression.cuda()  # 6维
+        expression_cuda = self.expression.cuda()  # 10维
         jaw_pose_cuda = self.jaw_pose.cuda()      # 3维
+        leye_pose_cuda = self.leye_pose.cuda()    # 3维
+        reye_pose_cuda = self.reye_pose.cuda()    # 3维
         
-        # 组合成72维特征: body(63) + expression(6) + jaw(3)
-        features = torch.cat([body_features, expression_cuda, jaw_pose_cuda])
+        # 组合成82维特征: body(63) + expression(10) + jaw(3) + leye_pose(3) + reye_pose(3)
+        features = torch.cat([body_features, expression_cuda, jaw_pose_cuda, leye_pose_cuda, reye_pose_cuda])
+        
+        # Debug: Print feature dimensions
+        if features.shape[0] != 82:
+            print(f"Warning: Expected 82 features, got {features.shape[0]}")
+            print(f"body_features: {body_features.shape[0]}, expression: {expression_cuda.shape[0]}, jaw_pose: {jaw_pose_cuda.shape[0]}, leye_pose: {leye_pose_cuda.shape[0]}, reye_pose: {reye_pose_cuda.shape[0]}")
+            # Truncate to 82 if needed
+            features = features[:82]
 
         return features
 
@@ -529,10 +540,10 @@ class GaussianModel:
         for key in ['grid', 'bbox_min', 'bbox_max', 'grid_dims']: ginfo[key] = torch.as_tensor(ginfo[key]).detach().cuda()
         self.weights_grid_info = ginfo
 
-        # Pose encoder - 扩展输入维度支持表情: body(63) + expression(6) + jaw(3) = 72
-        models = [MLP(layers_size_list=[72, 512, 256, 256, 256, self.num_basis+self.num_vt_basis]) for i in range(len(xyz_ft))]
+        # Pose encoder - 扩展输入维度支持表情: body(63) + expression(10) + jaw(3) + leye_pose(3) + reye_pose(3) = 82
+        models = [MLP(layers_size_list=[82, 512, 256, 256, 256, self.num_basis+self.num_vt_basis]) for i in range(len(xyz_ft))]
         params, _ = stack_module_state(models)
-        self.encoder_feat_model_meta = MLP(layers_size_list=[72, 512, 256, 256, 256, self.num_basis+self.num_vt_basis]).to('meta')
+        self.encoder_feat_model_meta = MLP(layers_size_list=[82, 512, 256, 256, 256, self.num_basis+self.num_vt_basis]).to('meta')
         for k, v in params.items():
             params[k] = nn.Parameter(v.cuda().requires_grad_(True))
         self.encoder_feat_params = params
@@ -802,7 +813,7 @@ class GaussianModel:
             # 检查pose参数的维度，如果是165维（旧格式），需要扩展以包含jaw_pose和expression
             if poses.shape[1] == 165:
                 # 旧格式: [global_orient(3) + body_pose(63) + jaw_pose(3) + padding(6) + hands(90)]
-                # 新格式: [global_orient(3) + body_pose(63) + jaw_pose(3) + expression(6) + hands(90)]
+                # 新格式: [global_orient(3) + body_pose(63) + jaw_pose(3) + expression(10) + hands(90)]
                 new_poses = []
                 for i in range(len(poses)):
                     pose = poses[i]
@@ -813,8 +824,8 @@ class GaussianModel:
                     # padding = pose[69:75]  # 6维填充，丢弃
                     left_hand_pose = pose[75:120]
                     right_hand_pose = pose[120:165]
-                    # 使用默认expression（6维）
-                    expression = np.zeros(6, dtype=np.float32)
+                    # 使用默认expression（10维）
+                    expression = np.zeros(10, dtype=np.float32)
                     
                     # 重新组合为新格式
                     new_pose = np.concatenate([
@@ -861,7 +872,7 @@ class GaussianModel:
         # 表情参数
         expressions = smpl_data.get('expression', None)
         if expressions is not None:
-            expressions = expressions[:, :6]  # 只使用前6维
+            expressions = expressions[:, :10]  # 使用前10维
 
         # 下颌参数
         jaw_poses = smpl_data.get('jaw_pose', None)
@@ -875,7 +886,15 @@ class GaussianModel:
         self.Rh = torch.eye(3, dtype=torch.float32)  # 使用单位矩阵
 
         if expression is not None:
-            self.expression = torch.from_numpy(expression).float()
+            # 确保expression是10维的
+            expr_tensor = torch.from_numpy(expression).float()
+            if expr_tensor.shape[0] > 10:
+                expr_tensor = expr_tensor[:10]
+            elif expr_tensor.shape[0] < 10:
+                # 如果不足10维，用0填充
+                padding = torch.zeros(10 - expr_tensor.shape[0], dtype=torch.float32)
+                expr_tensor = torch.cat([expr_tensor, padding])
+            self.expression = expr_tensor
         if jaw_pose is not None:
             self.jaw_pose = torch.from_numpy(jaw_pose).float()
 
