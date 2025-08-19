@@ -24,9 +24,25 @@ def get_render_choice(gaussians: GaussianModel, render_type, data):
 def load_pose_list(file_path):
     with open(file_path, 'r') as file:
         pose_list = json.load(file)
+    
+    has_expression = False
     for pose in pose_list:
         for key in ['pose', 'Rh', 'Th']:
             pose[key] = np.array(pose[key]).astype(np.float32)
+        # Handle expression if present, otherwise use default zeros
+        if 'expression' in pose:
+            pose['expression'] = np.array(pose['expression']).astype(np.float32)
+            has_expression = True
+        else:
+            pose['expression'] = np.zeros(10, dtype=np.float32)
+    
+    if has_expression:
+        print(f"✓ Successfully loaded expression parameters from {file_path}")
+        print(f"  - Total frames with expression: {len(pose_list)}")
+        print(f"  - Expression dimension: {pose_list[0]['expression'].shape[0]}")
+    else:
+        print(f"⚠ No expression parameters found in {file_path}, using default zeros")
+    
     return pose_list
 
 def load_cam_list(file_path):
@@ -64,6 +80,24 @@ class Visualizer:
     def load_cams_poses(self, model_dir):
         self.cam_list = load_cam_list(path.join(model_dir, 'cameras.json'))
         self.pose_list = load_pose_list(path.join(model_dir, 'poses.json'))
+        
+        # Print summary of loaded data
+        print(f"\n=== Model Loading Summary ===")
+        print(f"Model directory: {model_dir}")
+        print(f"Cameras loaded: {len(self.cam_list)}")
+        print(f"Poses loaded: {len(self.pose_list)}")
+        
+        # Check if expressions are present in loaded poses
+        has_expressions = any('expression' in pose and not np.allclose(pose['expression'], 0) for pose in self.pose_list)
+        if has_expressions:
+            print(f"✓ Expression data: Available")
+            # Print expression range for first few frames
+            for i in range(min(3, len(self.pose_list))):
+                expr = self.pose_list[i]['expression']
+                print(f"  Frame {i}: expression range [{expr.min():.3f}, {expr.max():.3f}]")
+        else:
+            print(f"⚠ Expression data: Not available (using default zeros)")
+        print(f"============================\n")
 
     @staticmethod
     def pklbytes_to_data(pklbytes):
@@ -72,11 +106,15 @@ class Visualizer:
         data['cam_pos'] = np.linalg.inv(data['w2c'])[:3,3]
 
         cuda_keys = ['K', 'w2c', 'background', 'cam_pos']
-        cpu_keys = ['pose', 'Rh', 'Th']
+        cpu_keys = ['pose', 'Rh', 'Th', 'expression']
         for key in cuda_keys:
             data[key] = torch.from_numpy(data[key]).float().cuda(non_blocking=True)
         for key in cpu_keys:
             data[key] = torch.from_numpy(data[key]).float()
+        
+        # Ensure expression is present, otherwise use default
+        if 'expression' not in data:
+            data['expression'] = torch.zeros(10, dtype=torch.float32)
         return data
 
     @torch.no_grad()
@@ -99,6 +137,19 @@ class Visualizer:
 
         gaussians.Rh, gaussians.Th = data['Rh'], data['Th']
         gaussians.smpl_poses = data['pose']
+        # Handle expression parameter
+        if 'expression' in data:
+            gaussians.expression = data['expression']
+            # Print expression info for first frame or when expression changes significantly
+            if not hasattr(self, '_last_expression_print') or torch.norm(data['expression'] - self._last_expression_print) > 0.1:
+                expr_range = [data['expression'].min().item(), data['expression'].max().item()]
+                print(f"🎭 Using expression parameters: range [{expr_range[0]:.3f}, {expr_range[1]:.3f}]")
+                self._last_expression_print = data['expression'].clone()
+        else:
+            gaussians.expression = torch.zeros(10, dtype=torch.float32)
+            if not hasattr(self, '_expression_warning_printed'):
+                print(f"⚠ No expression parameters received, using neutral expression")
+                self._expression_warning_printed = True
 
         override_color = get_render_choice(gaussians, None, data)
 

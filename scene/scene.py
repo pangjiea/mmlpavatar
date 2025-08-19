@@ -63,7 +63,7 @@ class Scene:
         )
 
         # collect all the poses and cams from dataset, and dump them to json file
-        all_poses, all_Th, all_Rh = {}, {}, {}
+        all_poses, all_Th, all_Rh, all_expression = {}, {}, {}, {}
         cam_list, pose_list = {}, {}
         trainset.is_load_image = False
         beta = trainset[0]['beta']
@@ -74,8 +74,9 @@ class Scene:
                 all_poses[str(frame_id)] = data['pose']
                 all_Th[str(frame_id)] = data['Th']
                 all_Rh[str(frame_id)] = data['Rh']
+                all_expression[str(frame_id)] = data['expression']
             
-                pose_list[str(frame_id)] = dict(frame_id=frame_id, pose=data['pose'], Th=data['Th'], Rh=data['Rh'])
+                pose_list[str(frame_id)] = dict(frame_id=frame_id, pose=data['pose'], Th=data['Th'], Rh=data['Rh'], expression=data['expression'])
 
             if str(cam_id) not in cam_list:
                 cam_list[str(cam_id)] = dict(cam_id=cam_id, w2c=data['w2c'], K=data['K'])
