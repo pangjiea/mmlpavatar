@@ -9,7 +9,7 @@ output/
 logs/
 checkpoints/
 results/
-
+render/
 # SMPL model files
 smpl_model/
 bins/

@@ -1,4 +1,3 @@
-
 import os
 from os import path
 import torch
@@ -94,6 +93,10 @@ def testing_novel_cam_pose_speed(gaussians: GaussianModel, out_dir, frame_ids, p
     gaussians.smpl_poses = torch.as_tensor(pose['pose'])
     gaussians.Th = torch.as_tensor(pose['Th'])
     gaussians.Rh = torch.as_tensor(pose['Rh'])
+    gaussians.expression = torch.as_tensor(pose.get('expression', torch.zeros(10)), dtype=torch.float32)
+    gaussians.jaw_pose = gaussians.smpl_poses[66:69]
+    gaussians.leye_pose = gaussians.smpl_poses[69:72]
+    gaussians.reye_pose = gaussians.smpl_poses[72:75]
     image, alpha, info = gaussians.render(cam, background=background)
     torch.cuda.synchronize()
 
@@ -107,6 +110,11 @@ def testing_novel_cam_pose_speed(gaussians: GaussianModel, out_dir, frame_ids, p
         gaussians.smpl_poses = torch.as_tensor(pose['pose'])
         gaussians.Th = torch.as_tensor(pose['Th'])
         gaussians.Rh = torch.as_tensor(pose['Rh'])
+        # 表情与眼睛控制（若不存在则使用默认0）
+        gaussians.expression = torch.as_tensor(pose.get('expression', torch.zeros(10)), dtype=torch.float32)
+        gaussians.jaw_pose = gaussians.smpl_poses[66:69]
+        gaussians.leye_pose = gaussians.smpl_poses[69:72]
+        gaussians.reye_pose = gaussians.smpl_poses[72:75]
 
         image, alpha, info = gaussians.render(cam, background=background)
 
@@ -131,6 +139,11 @@ def testing_novel_cam_pose(gaussians: GaussianModel, out_dir, frame_ids, pose_li
         gaussians.smpl_poses = torch.as_tensor(pose['pose']).cpu()
         gaussians.Th = torch.clone(torch.as_tensor(pose['Th']).cpu())
         gaussians.Rh = torch.as_tensor(pose['Rh']).cpu()
+        # 表情与眼睛控制（若不存在则使用默认0）
+        gaussians.expression = torch.as_tensor(pose.get('expression', torch.zeros(10)), dtype=torch.float32)
+        gaussians.jaw_pose = gaussians.smpl_poses[66:69]
+        gaussians.leye_pose = gaussians.smpl_poses[69:72]
+        gaussians.reye_pose = gaussians.smpl_poses[72:75]
         image, alpha, info = gaussians.render(cam, background=background)
 
         image = (torch.clamp(image, min=0, max=1.0) * 255).byte().contiguous().cpu().numpy()
@@ -154,6 +167,11 @@ def testing_dataset(gaussians: GaussianModel, out_dir, dataset, background):
         frame_id = cam['frame_id']
         gaussians.smpl_poses = cam['pose']
         gaussians.Th, gaussians.Rh = cam['Th'], cam['Rh']
+        # 表情与眼睛控制
+        gaussians.expression = cam.get('expression', torch.zeros(10))
+        gaussians.jaw_pose = gaussians.smpl_poses[66:69]
+        gaussians.leye_pose = gaussians.smpl_poses[69:72]
+        gaussians.reye_pose = gaussians.smpl_poses[72:75]
 
         image, alpha, info = gaussians.render(cam, background=background)
 
