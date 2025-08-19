@@ -112,9 +112,6 @@ class Visualizer:
         for key in cpu_keys:
             data[key] = torch.from_numpy(data[key]).float()
         
-        # Ensure expression is present, otherwise use default
-        if 'expression' not in data:
-            data['expression'] = torch.zeros(10, dtype=torch.float32)
         return data
 
     @torch.no_grad()

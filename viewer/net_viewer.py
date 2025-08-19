@@ -192,6 +192,7 @@ class GUI:
         self.render_type = 'image'
 
         self.pose = np.zeros(165, dtype=np.float32)
+        self.expression = np.zeros(10, dtype=np.float32)  # 新增: 表情参数
         self.Th = np.array([0,0,1.1], dtype=np.float32)
         self.Rh = Rotation.from_euler('x', np.pi/2).as_matrix()
 
@@ -224,6 +225,7 @@ class GUI:
         set_val('Rh', self.Rh)
         set_val('background', self.background)
         set_val('is_test', self.is_test)
+        set_val('expression', self.expression)  # 新增: 发送 expression
 
         return info
 
@@ -234,6 +236,11 @@ class GUI:
     def load_pose_list(self, poses):
         self.pose_list = poses
         dpg.configure_item('frame_id', max_value=len(self.pose_list)-1)
+        # 如果第一帧自带 expression，则初始化为该值，避免仍是全零
+        if len(self.pose_list) > 0:
+            expr0 = self.pose_list[0].get('expression', None)
+            if expr0 is not None:
+                self.expression = np.array(expr0, dtype=np.float32)
 
     def loop_function(self):
         info=dict(byte=0, frame=0)
@@ -346,9 +353,13 @@ class GUI:
             self.pose = pose_info['pose']
             self.Rh = pose_info['Rh']
             self.Th = pose_info['Th']
+            expr = pose_info.get('expression', None)
+            if expr is not None:
+                self.expression = np.array(expr, dtype=np.float32)
 
         def callback_tpose(sender, app_data):
             self.pose = np.zeros(165, dtype=np.float32)
+            # 不强制清零 expression，保留当前表情
             self.Rh = Rotation.from_euler('x', 90, degrees=True).as_matrix()
             self.Th = np.array([0, 0, 1.1], dtype=np.float32)
 
@@ -358,6 +369,7 @@ class GUI:
             big_poses[8] = np.deg2rad(-30)   
             
             self.pose = big_poses
+            # 不重置 expression
             self.Rh = Rotation.from_euler('x', 90, degrees=True).as_matrix()
             self.Th = np.array([0, 0, 1.1], dtype=np.float32)
 
@@ -390,6 +402,10 @@ class GUI:
             self.Th = pose_info['Th'] 
             if not self.is_transl: 
                 self.Th = np.zeros_like(pose_info['Th'])
+            # 仅当 novel pose 含 expression 时才更新
+            expr = pose_info.get('expression', None)
+            if expr is not None:
+                self.expression = np.array(expr, dtype=np.float32)
 
         def callback_is_no_transl(sender, app_data):
             self.is_transl = not app_data
