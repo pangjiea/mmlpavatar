@@ -68,6 +68,57 @@ def load_amass_pose_list(pose_path):
 
     return pose_list
 
+def load_smpl_params_with_rhth(pose_path):
+    """Load SMPL parameters with proper Rh and Th handling (consistent with dataset.py)"""
+    smpl_params = np.load(pose_path, allow_pickle=True)
+    smpl_params = dict(smpl_params)
+
+    # 支持不同的数据集格式
+    if 'Rh' in smpl_params:
+        N_frame = len(smpl_params['Rh'])
+    elif 'Th' in smpl_params:
+        N_frame = len(smpl_params['Th'])
+    elif 'global_orient' in smpl_params:
+        N_frame = len(smpl_params['global_orient'])
+    else:
+        raise ValueError("无法确定帧数，SMPL参数文件中缺少Rh、Th或global_orient")
+
+    pose_list = []
+    for frame_id in range(N_frame):
+        global_orient = smpl_params['global_orient'][frame_id] if 'global_orient' in smpl_params else np.zeros(3, dtype=np.float32)
+        jaw_pose = smpl_params['jaw_pose'][frame_id] if 'jaw_pose' in smpl_params else np.zeros(3, dtype=np.float32)
+        expression = smpl_params['expression'][frame_id] if 'expression' in smpl_params else np.zeros(10, dtype=np.float32)
+        leye_pose = smpl_params['leye_pose'][frame_id] if 'leye_pose' in smpl_params else np.zeros(3, dtype=np.float32)
+        reye_pose = smpl_params['reye_pose'][frame_id] if 'reye_pose' in smpl_params else np.zeros(3, dtype=np.float32)
+        # 规范 expression 维度并保证 float32
+        if len(expression) > 10:
+            expression = expression[:10]
+        elif len(expression) < 10:
+            expression = np.pad(expression, (0, 10 - len(expression)))
+        expression = np.asarray(expression, dtype=np.float32)
+
+        pose = np.concatenate([
+            global_orient.astype(np.float32),
+            smpl_params['body_pose'][frame_id].astype(np.float32),
+            jaw_pose.astype(np.float32),
+            leye_pose.astype(np.float32),
+            reye_pose.astype(np.float32),
+            smpl_params['left_hand_pose'][frame_id].astype(np.float32),
+            smpl_params['right_hand_pose'][frame_id].astype(np.float32),
+        ], axis=0).astype(np.float32)
+
+        if 'Th' in smpl_params:
+            Th = smpl_params['Th'][frame_id].astype(np.float32)
+        else:
+            Th = smpl_params['transl'][frame_id].astype(np.float32)
+        if 'Rh' in smpl_params:
+            Rh = smpl_params['Rh'][frame_id].astype(np.float32)
+        else:
+            Rh = np.eye(3, dtype=np.float32)
+
+        pose_list.append(dict(pose=pose, Th=Th, Rh=Rh, expression=expression.astype(np.float32)))
+    return pose_list
+#原先加载npz方法，但缺少expression jawpose eyepose 目前不调用
 def load_thuman_pose_list(pose_path):
     smpl_params = np.load(pose_path, allow_pickle=True)
     smpl_params = dict(smpl_params)
@@ -90,10 +141,16 @@ def testing_novel_cam_pose_speed(gaussians: GaussianModel, out_dir, frame_ids, p
 
     # warm up
     pose = pose_list[0]
-    gaussians.smpl_poses = torch.as_tensor(pose['pose'])
-    gaussians.Th = torch.as_tensor(pose['Th'])
-    gaussians.Rh = torch.as_tensor(pose['Rh'])
-    gaussians.expression = torch.as_tensor(pose.get('expression', torch.zeros(10)), dtype=torch.float32)
+    gaussians.smpl_poses = torch.as_tensor(pose['pose'], dtype=torch.float32)
+    gaussians.Th = torch.as_tensor(pose['Th'], dtype=torch.float32)
+    gaussians.Rh = torch.as_tensor(pose['Rh'], dtype=torch.float32)
+    #  获取不到 expression 时打印
+    if 'expression' in pose and pose['expression'] is not None:
+        expr = pose['expression']
+    else:
+        print('[Info] expression 缺失, 使用零向量 (warmup frame 0)')
+        expr = torch.zeros(10, dtype=torch.float32)
+    gaussians.expression = torch.as_tensor(expr, dtype=torch.float32)
     gaussians.jaw_pose = gaussians.smpl_poses[66:69]
     gaussians.leye_pose = gaussians.smpl_poses[69:72]
     gaussians.reye_pose = gaussians.smpl_poses[72:75]
@@ -107,11 +164,16 @@ def testing_novel_cam_pose_speed(gaussians: GaussianModel, out_dir, frame_ids, p
 
     for frame_id in frame_ids:
         pose = pose_list[frame_id]
-        gaussians.smpl_poses = torch.as_tensor(pose['pose'])
-        gaussians.Th = torch.as_tensor(pose['Th'])
-        gaussians.Rh = torch.as_tensor(pose['Rh'])
-        # 表情与眼睛控制（若不存在则使用默认0）
-        gaussians.expression = torch.as_tensor(pose.get('expression', torch.zeros(10)), dtype=torch.float32)
+        gaussians.smpl_poses = torch.as_tensor(pose['pose'], dtype=torch.float32)
+        gaussians.Th = torch.as_tensor(pose['Th'], dtype=torch.float32)
+        gaussians.Rh = torch.as_tensor(pose['Rh'], dtype=torch.float32)
+        # 表情与眼睛控制（若不存在则使用默认0并打印）
+        if 'expression' in pose and pose['expression'] is not None:
+            expr = pose['expression']
+        else:
+            print(f'[Info] expression 缺失, 使用零向量 (frame {frame_id})')
+            expr = torch.zeros(10, dtype=torch.float32)
+        gaussians.expression = torch.as_tensor(expr, dtype=torch.float32)
         gaussians.jaw_pose = gaussians.smpl_poses[66:69]
         gaussians.leye_pose = gaussians.smpl_poses[69:72]
         gaussians.reye_pose = gaussians.smpl_poses[72:75]
@@ -134,18 +196,22 @@ def testing_novel_cam_pose(gaussians: GaussianModel, out_dir, frame_ids, pose_li
     os.makedirs(path.join(out_dir), exist_ok=True)
     for frame_id in tqdm(frame_ids):
         pose = pose_list[frame_id]
-        pose = copy.deepcopy(pose)
 
-        gaussians.smpl_poses = torch.as_tensor(pose['pose']).cpu()
-        gaussians.Th = torch.clone(torch.as_tensor(pose['Th']).cpu())
-        gaussians.Rh = torch.as_tensor(pose['Rh']).cpu()
-        # 表情与眼睛控制（若不存在则使用默认0）
-        gaussians.expression = torch.as_tensor(pose.get('expression', torch.zeros(10)), dtype=torch.float32)
+        gaussians.smpl_poses = torch.as_tensor(pose['pose'], dtype=torch.float32)
+        gaussians.Th = torch.as_tensor(pose['Th'], dtype=torch.float32)
+        gaussians.Rh = torch.as_tensor(pose['Rh'], dtype=torch.float32)
+        # 修改: 获取不到 expression 时打印
+        if 'expression' in pose and pose['expression'] is not None:
+            expr = pose['expression']
+        else:
+            print(f'[Info] expression 缺失, 使用零向量 (frame {frame_id})')
+            expr = torch.zeros(10, dtype=torch.float32)
+        gaussians.expression = torch.as_tensor(expr, dtype=torch.float32)
         gaussians.jaw_pose = gaussians.smpl_poses[66:69]
         gaussians.leye_pose = gaussians.smpl_poses[69:72]
         gaussians.reye_pose = gaussians.smpl_poses[72:75]
         image, alpha, info = gaussians.render(cam, background=background)
-
+    
         image = (torch.clamp(image, min=0, max=1.0) * 255).byte().contiguous().cpu().numpy()
         iio.imwrite(path.join(out_dir, f'{frame_id:08d}.png'), image)
 
@@ -165,10 +231,15 @@ def testing_dataset(gaussians: GaussianModel, out_dir, dataset, background):
     for cam in tqdm(test_dataloader):
         cam = data_to_cam(cam, non_blocking=False)
         frame_id = cam['frame_id']
-        gaussians.smpl_poses = cam['pose']
-        gaussians.Th, gaussians.Rh = cam['Th'], cam['Rh']
-        # 表情与眼睛控制
-        gaussians.expression = cam.get('expression', torch.zeros(10))
+        gaussians.smpl_poses = cam['pose'].float()
+        gaussians.Th, gaussians.Rh = cam['Th'].float(), cam['Rh'].float()
+        # 表情与眼睛控制 (缺失则打印)
+        if 'expression' in cam and cam['expression'] is not None:
+            expr = cam['expression'].float()
+        else:
+            print(f'[Info] expression 缺失, 使用零向量 (dataset frame {frame_id})')
+            expr = torch.zeros(10, dtype=torch.float32)
+        gaussians.expression = torch.as_tensor(expr, dtype=torch.float32)
         gaussians.jaw_pose = gaussians.smpl_poses[66:69]
         gaussians.leye_pose = gaussians.smpl_poses[69:72]
         gaussians.reye_pose = gaussians.smpl_poses[72:75]
@@ -192,9 +263,13 @@ def testing(args: Config):
     init_smpl_pose()
 
     gaussians = load_model(args.model_dir)
+    # 强制 encoder_feat_params 转为 float32 避免 Double/Float 混用
+    if hasattr(gaussians, 'encoder_feat_params') and isinstance(gaussians.encoder_feat_params, dict):
+        for k in list(gaussians.encoder_feat_params.keys()):
+            gaussians.encoder_feat_params[k] = gaussians.encoder_feat_params[k].float()
     gaussians.is_test = args.test.is_test
     gaussians.prepare_test()
-    background = torch.as_tensor(np.array(args.background)).float().cuda()
+    background = torch.as_tensor(np.array(args.background), dtype=torch.float32).cuda()
 
     # Dataset
     test_frame_ids = np.arange(args.test.begin_ith_frame, args.test.begin_ith_frame+args.test.frame_interval*args.test.num_frame, args.test.frame_interval).tolist()
@@ -208,7 +283,7 @@ def testing(args: Config):
         cam['K'] = torch.as_tensor(K).cuda()
 
         if 'smpl_params.npz' in args.test.pose_path:
-            pose_list = load_thuman_pose_list(args.test.pose_path)
+            pose_list = load_smpl_params_with_rhth(args.test.pose_path)
         else:
             pose_list = load_amass_pose_list(args.test.pose_path)
 
