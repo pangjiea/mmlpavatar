@@ -243,7 +243,10 @@ def testing_dataset(gaussians: GaussianModel, out_dir, dataset, background):
     # Optional FID (skip gracefully if torchmetrics/weights unavailable)
     fid = None
     try:
-        from torchmetrics.image import FrechetInceptionDistance
+        try:
+            from torchmetrics.image.fid import FrechetInceptionDistance
+        except Exception:
+            from torchmetrics.image import FrechetInceptionDistance
         fid = FrechetInceptionDistance(feature=2048).cuda()
     except Exception as e:
         print(f"[info] FID unavailable, skipping: {e}")

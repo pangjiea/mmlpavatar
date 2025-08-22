@@ -6,7 +6,7 @@ import urllib.request
 from torch.nn.functional import l1_loss
 from torchmetrics.functional.image import peak_signal_noise_ratio, structural_similarity_index_measure
 from torchmetrics.image import LearnedPerceptualImagePatchSimilarity
-from torch.cuda.amp import autocast
+from torch import amp
 
 from scene.gaussian_model import GaussianModel
 
@@ -51,7 +51,8 @@ def lpips_loss(img1, img2):
         for p in lpips_model.parameters(): p.requires_grad = False
     # Reduce memory via autocast; fallback to CPU if OOM
     try:
-        with autocast(device_type='cuda', dtype=torch.float16):
+        # Use torch.amp.autocast('cuda', ...) per PyTorch 2.x recommendation
+        with amp.autocast("cuda", dtype=torch.float16):
             loss = lpips_model(img1, img2)
     except torch.cuda.OutOfMemoryError:
         torch.cuda.empty_cache()
