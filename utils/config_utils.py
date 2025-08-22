@@ -64,6 +64,12 @@ class Config:
     sss_opacity_reg = 0.0
     
     init_num_gs = 200_000
+    # SSS densification
+    cap_max = 2_000_000
+    opacity_threshold = 1e-3
+    densify_from_iter = 1000
+    densify_until_iter = 300000
+    densification_interval = 100
 
     # anchor points and control points
     num_verts = 10000

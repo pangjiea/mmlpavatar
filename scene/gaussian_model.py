@@ -49,6 +49,7 @@ from scene.mlp import MLP, vmap_mlp
 from utils.smpl_utils import smpl, interpolate_skinningfield, rigid_transform_tensor, rigid_transform_numba
 from utils.config_utils import Config
 from utils.sh_utils import RGB2SH
+from utils.sss_reloc import compute_relocation_student_t_cuda
 
 class GaussianModel:
 
@@ -824,6 +825,184 @@ class GaussianModel:
         nbr_gs_wght = nbr_gs_invdist / torch.sum(nbr_gs_invdist, dim=-1, keepdim=True)
         self.nbr_vtft = nbr_gs
         self.nbr_vtft_wght = nbr_gs_wght
+
+    def _update_interpolating_weights_for_new(self, new_xyz):
+        from pytorch3d.ops import knn_points as _knn
+        xyz_vt = self.xyz_vt
+        xyz_ft = self.xyz_ft
+        dists, idxs, _ = _knn(p1=new_xyz[None], p2=xyz_vt[None], K=3)
+        nbr_gs = idxs[0]
+        nbr_gs_invdist = 1 / torch.sqrt(dists[0])
+        self.nbr_gs = torch.cat([self.nbr_gs, nbr_gs], dim=0)
+        self.nbr_gs_invdist = torch.cat([self.nbr_gs_invdist, nbr_gs_invdist], dim=0)
+        dists, idxs, _ = _knn(p1=new_xyz[None], p2=xyz_ft[None], K=3)
+        nbr_gs = idxs[0]
+        nbr_gs_invdist = 1 / torch.sqrt(dists[0])
+        nbr_gs_wght = nbr_gs_invdist / torch.sum(nbr_gs_invdist, dim=-1, keepdim=True)
+        self.nbr_gsft = torch.cat([self.nbr_gsft, nbr_gs], dim=0)
+        self.nbr_gsft_wght = torch.cat([self.nbr_gsft_wght, nbr_gs_wght], dim=0)
+
+    # =============== SSS densification and recycling ===============
+    def _sample_alives(self, probs, num, alive_indices=None):
+        probs = probs.abs() / (probs.abs().sum() + torch.finfo(torch.float32).eps)
+        sampled_idxs = torch.multinomial(probs, num, replacement=True)
+        if alive_indices is not None:
+            sampled_idxs = alive_indices[sampled_idxs]
+        ratio = torch.bincount(sampled_idxs, minlength=self._opacity.shape[0]).unsqueeze(-1)
+        return sampled_idxs, ratio
+
+    def _update_params(self, idxs, ratio):
+        op = self.get_opacity
+        if op.ndim == 2:
+            op = op[:, 0]
+        neg = self.get_negative
+        if neg.ndim == 2:
+            neg = neg[:, 0]
+        nu = self.get_nu_degree
+        nu_flat = nu[:, 0] if nu.ndim == 2 else nu
+        new_opacity, new_scaling = compute_relocation_student_t_cuda(
+            opacity_old=(op[idxs] * neg[idxs]).contiguous(),
+            scale_old=self.get_cano_scaling[idxs].contiguous(),
+            nu_degree=nu_flat[idxs].contiguous(),
+            N=ratio[idxs, 0].contiguous() + 1,
+        )
+        new_opacity = torch.clamp(new_opacity.unsqueeze(-1), max=1.0 - torch.finfo(torch.float32).eps, min=-1.0 + torch.finfo(torch.float32).eps)
+        new_opacity = torch.where((new_opacity >= 0) & (new_opacity < 0.005), 0.005, new_opacity)
+        new_opacity = torch.where((new_opacity < 0) & (new_opacity > -0.005), -0.005, new_opacity)
+        new_opacity = (new_opacity / self.get_negative[idxs]).squeeze(-1)
+        new_opacity = self.inverse_opacity_activation(new_opacity)
+        new_scaling = self.scaling_inverse_activation(new_scaling.reshape(-1, 3))
+        new_xyz = self._xyz[idxs]
+        new_sh0 = self._sh0[idxs]
+        new_shN = self._shN[idxs]
+        new_rot = self._rotation[idxs]
+        new_deg = self._degree[idxs]
+        new_neg = self._negative[idxs]
+        return new_xyz, new_sh0, new_shN, new_opacity, new_scaling, new_rot, new_deg, new_neg
+
+    def cat_tensors_to_optimizer(self, tensors_dict, inds):
+        if self.sss_optimizer is None:
+            return {}
+        optimizable_tensors = {}
+        for group in self.sss_optimizer.param_groups:
+            name = group.get('name', '')
+            if name not in tensors_dict:
+                continue
+            ext = tensors_dict[name]
+            param = group['params'][0]
+            state = self.sss_optimizer.state.get(param, None)
+            new_param = nn.Parameter(torch.cat((param.data, ext.detach()), dim=0).requires_grad_(True))
+            if state is not None:
+                new_state = {}
+                for k, v in state.items():
+                    if torch.is_tensor(v):
+                        pad = torch.zeros_like(ext.detach())
+                        new_state[k] = torch.cat((v, pad), dim=0)
+                    else:
+                        new_state[k] = v
+                del self.sss_optimizer.state[param]
+                group['params'][0] = new_param
+                self.sss_optimizer.state[new_param] = new_state
+            else:
+                group['params'][0] = new_param
+            optimizable_tensors[name] = new_param
+        if 'xyz' in optimizable_tensors:
+            self.xyz_offset = optimizable_tensors['xyz']
+        if 'scaling' in optimizable_tensors:
+            self._scaling = optimizable_tensors['scaling']
+        if 'rotation' in optimizable_tensors:
+            self._rotation = optimizable_tensors['rotation']
+        if 'opacity' in optimizable_tensors:
+            self._opacity = optimizable_tensors['opacity']
+        if 'f_dc' in optimizable_tensors:
+            self._sh0 = optimizable_tensors['f_dc']
+        if 'f_rest' in optimizable_tensors:
+            self._shN = optimizable_tensors['f_rest']
+        if 'degree' in optimizable_tensors:
+            self._degree = optimizable_tensors['degree']
+        if 'negative' in optimizable_tensors:
+            self._negative = optimizable_tensors['negative']
+        return optimizable_tensors
+
+    def replace_tensors_to_optimizer(self, inds=None):
+        if self.sss_optimizer is None:
+            return
+        for group in self.sss_optimizer.param_groups:
+            param = group['params'][0]
+            state = self.sss_optimizer.state.get(param, None)
+            if state is not None and inds is not None and 'momentum' in state:
+                try:
+                    state['momentum'][inds] = 0
+                except Exception:
+                    pass
+
+    def replace_tensors_to_optimizer_momentum(self, inds=None):
+        if self.sss_optimizer is None or inds is None:
+            return
+        for group in self.sss_optimizer.param_groups:
+            param = group['params'][0]
+            state = self.sss_optimizer.state.get(param, None)
+            if state is not None and 'momentum' in state:
+                try:
+                    state['momentum'][inds] = 0
+                except Exception:
+                    pass
+
+    def densification_postfix(self, new_xyz, new_sh0, new_shN, new_opacity, new_scaling, new_rotation, new_degree, new_negative, indices, reset_params=True):
+        self._xyz = torch.cat([self._xyz, new_xyz.detach()], dim=0)
+        ext = {
+            'xyz': torch.zeros((new_xyz.shape[0],) + self.xyz_offset.shape[1:], device=self.xyz_offset.device, dtype=self.xyz_offset.dtype),
+            'f_dc': new_sh0.detach(),
+            'f_rest': new_shN.detach(),
+            'opacity': new_opacity.detach(),
+            'scaling': new_scaling.detach(),
+            'rotation': new_rotation.detach(),
+            'degree': new_degree.detach(),
+            'negative': new_negative.detach(),
+        }
+        self.cat_tensors_to_optimizer(ext, indices)
+        self._update_interpolating_weights_for_new(new_xyz.detach())
+
+    def recycle_components(self, dead_mask=None):
+        if dead_mask is None or dead_mask.sum() == 0:
+            return
+        alive_mask = ~dead_mask
+        dead_indices = dead_mask.nonzero(as_tuple=True)[0]
+        alive_indices = alive_mask.nonzero(as_tuple=True)[0]
+        if dead_mask.sum() > int(0.05 * self._opacity.shape[0]):
+            sorted_vals, indices = torch.sort(torch.abs(self.get_opacity if self.get_opacity.ndim==1 else self.get_opacity[:,0]))
+            dead_indices = indices[0:int(0.05 * self._opacity.shape[0])]
+        if alive_indices.shape[0] <= 0:
+            return
+        probs = (self.get_opacity[alive_indices] if self.get_opacity.ndim==1 else self.get_opacity[alive_indices,0])
+        reinit_idx, ratio = self._sample_alives(alive_indices=alive_indices, probs=probs, num=dead_indices.shape[0])
+        (new_xyz, new_sh0, new_shN, new_opacity, new_scaling, new_rotation, new_degree, _) = self._update_params(reinit_idx, ratio=ratio)
+        self._xyz[dead_indices] = new_xyz
+        self._sh0[dead_indices] = new_sh0
+        self._shN[dead_indices] = new_shN
+        self._opacity[dead_indices] = new_opacity
+        self._scaling[dead_indices] = new_scaling
+        self._rotation[dead_indices] = new_rotation
+        self._degree[dead_indices] = new_degree
+        self._opacity[reinit_idx] = self._opacity[dead_indices]
+        self._scaling[reinit_idx] = self._scaling[dead_indices]
+        self.replace_tensors_to_optimizer(inds=reinit_idx)
+        self.replace_tensors_to_optimizer_momentum(inds=dead_indices)
+
+    def add_components(self, cap_max):
+        current_num_points = int(self._opacity.shape[0])
+        target_num = min(int(cap_max), int(1.05 * current_num_points))
+        num_gs = max(0, target_num - current_num_points)
+        if num_gs <= 0:
+            return 0
+        probs = (self.get_opacity if self.get_opacity.ndim==1 else self.get_opacity[:,0])
+        add_idx, ratio = self._sample_alives(probs=probs, num=num_gs)
+        (new_xyz, new_sh0, new_shN, new_opacity, new_scaling, new_rotation, new_degree, new_negative) = self._update_params(add_idx, ratio=ratio)
+        self._opacity[add_idx] = new_opacity
+        self._scaling[add_idx] = new_scaling
+        self.densification_postfix(new_xyz, new_sh0, new_shN, new_opacity, new_scaling, new_rotation, new_degree, new_negative, add_idx, reset_params=False)
+        self.replace_tensors_to_optimizer(inds=add_idx)
+        return num_gs
 
     def save_gaussian_sequence_to_ply(self, smpl_params_path, output_dir, frame_start=0, frame_end=None, frame_step=1, format_type='standard'):
         """

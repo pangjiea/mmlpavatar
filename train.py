@@ -238,6 +238,19 @@ def training(args: Config):
 
         gaussians.optimizer_step()
 
+        # SSS densification / recycling
+        if gaussians.renderer_backend == 'sss' and getattr(args, 'optimizer', 'adam') == 'sghmc':
+            try:
+                if (iteration < args.densify_until_iter and iteration > args.densify_from_iter and iteration % args.densification_interval == 0):
+                    op = gaussians.get_opacity
+                    op_flat = op if op.ndim == 1 else op[:, 0]
+                    dead_mask = torch.logical_and(op_flat < args.opacity_threshold, op_flat > -args.opacity_threshold)
+                    gaussians.recycle_components(dead_mask=dead_mask)
+                    gaussians.add_components(args.cap_max)
+                    torch.cuda.empty_cache()
+            except Exception as e:
+                print(f"[warn] densify/recycle failed: {e}")
+
         if iteration == args.iteration_dxyz_basis:
             gaussians.is_dxyz_bs = True
             print(f'[ITER {iteration}] Control point basis')
