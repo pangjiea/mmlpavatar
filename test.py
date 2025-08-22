@@ -20,6 +20,7 @@ from scene.gaussian_model import GaussianModel
 from scene.net_vis import load_model
 from utils.config_utils import Config
 from utils.image_utils import encode_bytes
+from utils.loss_utils import l1_loss as l1_loss_fn, psnr as psnr_fn, ssim_loss as ssim_loss_fn, lpips_loss as lpips_loss_fn
 from utils.smpl_utils import init_smpl_pose
 
 def fovx_to_intrinsic(fovx, H, W):
@@ -228,6 +229,21 @@ def testing_dataset(gaussians: GaussianModel, out_dir, dataset, background):
     for k in ['gt', 'result', 'mask']:
         os.makedirs(path.join(out_dir, k), exist_ok=True)
 
+    # Metrics accumulators
+    l1_sum = 0.0
+    psnr_sum = 0.0
+    ssim_sum = 0.0
+    lpips_sum = 0.0
+    num = 0
+
+    # Optional FID (skip gracefully if torchmetrics/weights unavailable)
+    fid = None
+    try:
+        from torchmetrics.image import FrechetInceptionDistance
+        fid = FrechetInceptionDistance(feature=2048).cuda()
+    except Exception as e:
+        print(f"[info] FID unavailable, skipping: {e}")
+
     for cam in tqdm(test_dataloader):
         cam = data_to_cam(cam, non_blocking=False)
         frame_id = cam['frame_id']
@@ -245,17 +261,70 @@ def testing_dataset(gaussians: GaussianModel, out_dir, dataset, background):
         gaussians.reye_pose = gaussians.smpl_poses[72:75]
 
         image, alpha, info = gaussians.render(cam, background=background)
-
-        image = (torch.clamp(image, min=0, max=1.0) * 255).byte().contiguous().cpu().numpy()
+        image = torch.clamp(image, min=0.0, max=1.0)
 
         image_gt = cam['image']
         image_gt[~cam['mask']] = background
-        image_gt = (image_gt * 255).byte().contiguous().cpu().numpy()
+
+        # Metrics on float tensors
+        try:
+            l1_sum += l1_loss_fn(image, image_gt).mean().float()
+            psnr_sum += psnr_fn(image, image_gt).mean().float()
+            ssim_sum += (1.0 - ssim_loss_fn(image, image_gt)).mean().float()
+            lpips_sum += lpips_loss_fn(image, image_gt).mean().float()
+            num += 1
+        except Exception as e:
+            if num == 0:
+                print(f"[info] image metrics unavailable, skipping some: {e}")
+
+        # FID expects uint8 CHW batches
+        if fid is not None:
+            try:
+                pred_chw = (image.permute(2,0,1)[None] * 255.0).clamp(0,255).byte()
+                gt_chw = (image_gt.permute(2,0,1)[None] * 255.0).clamp(0,255).byte()
+                fid.update(pred_chw, real=False)
+                fid.update(gt_chw, real=True)
+            except Exception as e:
+                print(f"[info] FID update failed for frame {int(frame_id)}: {e}")
+
+        # Convert to numpy for saving
+        image_np = (image * 255).byte().contiguous().cpu().numpy()
+        image_gt_np = (image_gt * 255).byte().contiguous().cpu().numpy()
         mask = cam['mask'].byte().contiguous().cpu().numpy() * 255
 
-        iio.imwrite(path.join(out_dir, f'gt/{frame_id:08d}.png'), image_gt)
-        iio.imwrite(path.join(out_dir, f'result/{frame_id:08d}.png'), image)
+        iio.imwrite(path.join(out_dir, f'gt/{frame_id:08d}.png'), image_gt_np)
+        iio.imwrite(path.join(out_dir, f'result/{frame_id:08d}.png'), image_np)
         iio.imwrite(path.join(out_dir, f'mask/{frame_id:08d}.png'), mask)
+
+    # Summarize metrics
+    if num > 0:
+        l1_mean = l1_sum / num
+        psnr_mean = psnr_sum / num
+        ssim_mean = ssim_sum / num
+        lpips_mean = lpips_sum / num
+    else:
+        l1_mean = psnr_mean = ssim_mean = lpips_mean = None
+
+    fid_val = None
+    if fid is not None:
+        try:
+            fid_val = fid.compute()
+        except Exception as e:
+            print(f"[info] FID compute failed: {e}")
+
+    # Print summary
+    msg = "[TEST] Metrics:"
+    if l1_mean is not None:
+        msg += f" L1 {l1_mean}"
+    if psnr_mean is not None:
+        msg += f" PSNR {psnr_mean}"
+    if ssim_mean is not None:
+        msg += f" SSIM {ssim_mean}"
+    if lpips_mean is not None:
+        msg += f" LPIPS {lpips_mean}"
+    if fid_val is not None:
+        msg += f" FID {fid_val}"
+    print(msg)
 
 
 @torch.no_grad()
