@@ -397,5 +397,6 @@ if __name__ == "__main__":
     args.data_dir, args.out_dir, args.model_dir, args.test.cam_path, args.test.pose_path = pargs.data_dir, pargs.out_dir, pargs.model_dir, pargs.cam_path, pargs.pose_path
     args.test.is_test, args.test.test_speed = pargs.test, pargs.test_speed
     torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
 
     testing(args)

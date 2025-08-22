@@ -439,5 +439,6 @@ if __name__ == "__main__":
     safe_state(False, args.seed)
 
     torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     training(args)

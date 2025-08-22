@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 import ssl
 import urllib.request
+import os
 
 from torch.nn.functional import l1_loss
 from torchmetrics.functional.image import peak_signal_noise_ratio, structural_similarity_index_measure
@@ -34,7 +35,8 @@ def lpips_loss(img1, img2):
     if lpips_model is None:
         try:
             # Try normal SSL verification first
-            lpips_model = LearnedPerceptualImagePatchSimilarity(net_type='vgg', normalize=True).cuda().eval()
+            net_type = os.environ.get('LPIPS_NET_TYPE', 'vgg')  # vgg|alex|squeeze
+            lpips_model = LearnedPerceptualImagePatchSimilarity(net_type=net_type, normalize=True).cuda().eval()
         except (ssl.SSLError, urllib.error.URLError) as e:
             print(f"SSL error when downloading VGG model: {e}")
             print("Attempting download with SSL verification disabled...")
@@ -42,13 +44,19 @@ def lpips_loss(img1, img2):
             old_context = ssl._create_default_https_context
             ssl._create_default_https_context = ssl._create_unverified_context
             try:
-                lpips_model = LearnedPerceptualImagePatchSimilarity(net_type='vgg', normalize=True).cuda().eval()
+                net_type = os.environ.get('LPIPS_NET_TYPE', 'vgg')
+                lpips_model = LearnedPerceptualImagePatchSimilarity(net_type=net_type, normalize=True).cuda().eval()
                 print("Successfully downloaded VGG model with SSL verification disabled")
             finally:
                 # Restore SSL context
                 ssl._create_default_https_context = old_context
         
         for p in lpips_model.parameters(): p.requires_grad = False
+        # Reduce memory footprint
+        try:
+            lpips_model.half()
+        except Exception:
+            pass
     # Reduce memory via autocast; fallback to CPU if OOM
     # Try CUDA AMP; if OOM, rethrow to let caller decide (skip/handle)
     # Avoid silent CPU fallback to maintain performance on GPU
