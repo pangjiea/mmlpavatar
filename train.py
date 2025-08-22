@@ -292,6 +292,16 @@ def training_report(scene: Scene, gaussians: GaussianModel, iteration, test_iter
         torch.cuda.empty_cache()
         l1_test = 0.0
         psnr_test = 0.0
+        ssim_test = 0.0
+        lpips_test = 0.0
+
+        # Optional FID metric (skips gracefully if unavailable)
+        fid = None
+        try:
+            from torchmetrics.image import FrechetInceptionDistance
+            fid = FrechetInceptionDistance(feature=2048).cuda()
+        except Exception as e:
+            print(f"[info] FID unavailable, skipping: {e}")
 
         rng = random.Random(0)
         write_idxs = [rng.randint(0, len(scene.trainset)-1) for _ in range(10)]
@@ -321,8 +331,36 @@ def training_report(scene: Scene, gaussians: GaussianModel, iteration, test_iter
             image_gt = cam['image']
             image_gt[~cam['mask']] = background
 
+            # L1 / PSNR
             l1_test += l1_loss(image, image_gt).mean().float()
             psnr_test += psnr(image, image_gt).mean().float()
+
+            # SSIM (as metric, not loss)
+            try:
+                from utils.loss_utils import ssim_loss, lpips_loss
+                ssim_val = (1.0 - ssim_loss(image, image_gt)).mean().float()
+                ssim_test += ssim_val
+            except Exception as e:
+                if cam_num == 0:
+                    print(f"[info] SSIM unavailable, skipping: {e}")
+
+            # LPIPS
+            try:
+                lpips_val = lpips_loss(image, image_gt).mean().float()
+                lpips_test += lpips_val
+            except Exception as e:
+                if cam_num == 0:
+                    print(f"[info] LPIPS unavailable, skipping: {e}")
+
+            # FID updates expect CHW uint8/float batches
+            if fid is not None:
+                try:
+                    pred_chw = (image.permute(2,0,1)[None] * 255.0).clamp(0,255).byte()
+                    gt_chw = (image_gt.permute(2,0,1)[None] * 255.0).clamp(0,255).byte()
+                    fid.update(pred_chw, real=False)
+                    fid.update(gt_chw, real=True)
+                except Exception as e:
+                    print(f"[info] FID update failed for a sample: {e}")
             cam_num += 1
 
             if cam['idx'] in write_idxs:
@@ -332,11 +370,39 @@ def training_report(scene: Scene, gaussians: GaussianModel, iteration, test_iter
                     tb_writer.add_images(f'train_view_{cam_id:02d}_{frame_id:06d}/ground_truth', image_gt.permute(2,0,1)[None], global_step=iteration)
 
         psnr_test /= cam_num
-        l1_test /= cam_num          
-        print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, 'train', l1_test, psnr_test))
+        l1_test /= cam_num
+        if ssim_test != 0:
+            ssim_test /= cam_num
+        if lpips_test != 0:
+            lpips_test /= cam_num
 
+        # Compute FID if available
+        fid_val = None
+        if fid is not None:
+            try:
+                fid_val = fid.compute()
+            except Exception as e:
+                print(f"[info] FID compute failed: {e}")
+
+        # Console summary
+        msg = f"\n[ITER {iteration}] Evaluating train: L1 {l1_test} PSNR {psnr_test}"
+        if ssim_test != 0:
+            msg += f" SSIM {ssim_test}"
+        if lpips_test != 0:
+            msg += f" LPIPS {lpips_test}"
+        if fid_val is not None:
+            msg += f" FID {fid_val}"
+        print(msg)
+
+        # TensorBoard
         tb_writer.add_scalar('train/l1_loss', l1_test, iteration)
         tb_writer.add_scalar('train/psnr', psnr_test, iteration)
+        if ssim_test != 0:
+            tb_writer.add_scalar('train/ssim', ssim_test, iteration)
+        if lpips_test != 0:
+            tb_writer.add_scalar('train/lpips', lpips_test, iteration)
+        if fid_val is not None:
+            tb_writer.add_scalar('train/fid', fid_val, iteration)
         tb_writer.add_scalar('total_gaussians', gaussians.get_xyz.shape[0], iteration)
         torch.cuda.empty_cache()
 
