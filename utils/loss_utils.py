@@ -50,20 +50,18 @@ def lpips_loss(img1, img2):
         
         for p in lpips_model.parameters(): p.requires_grad = False
     # Reduce memory via autocast; fallback to CPU if OOM
-    try:
-        # Proactively free cache to reduce risk of fallback
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        # Use torch.amp.autocast('cuda', ...) per PyTorch 2.x recommendation
-        with amp.autocast("cuda", dtype=torch.float16):
-            loss = lpips_model(img1, img2)
-    except torch.cuda.OutOfMemoryError:
-        torch.cuda.empty_cache()
-        dev = img1.device
-        lpips_model_cpu = lpips_model.to('cpu')
-        loss = lpips_model_cpu(img1.cpu(), img2.cpu()).float()
-        lpips_model.to(dev)
-        loss = loss.to(dev)
+    # Try CUDA AMP; if OOM, rethrow to let caller decide (skip/handle)
+    # Avoid silent CPU fallback to maintain performance on GPU
+    if img1.is_cuda and img2.is_cuda:
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            with amp.autocast("cuda", dtype=torch.float16):
+                loss = lpips_model(img1, img2)
+        except torch.cuda.OutOfMemoryError as e:
+            raise e
+    else:
+        loss = lpips_model(img1, img2)
     return loss
 
 def dxyz_smooth_loss(gaussians: GaussianModel):
