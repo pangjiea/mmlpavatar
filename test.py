@@ -15,7 +15,6 @@ import copy
 from scipy.spatial.transform import Rotation
 import imageio.v3 as iio
 from torch.utils.data import DataLoader
-import torch.nn.functional as F
 
 from scene.dataset import get_dataset_type, data_to_cam
 from scene.gaussian_model import GaussianModel
@@ -276,20 +275,7 @@ def testing_dataset(gaussians: GaussianModel, out_dir, dataset, background):
             l1_sum += l1_loss_fn(image, image_gt).mean().float()
             psnr_sum += psnr_fn(image, image_gt).mean().float()
             ssim_sum += (1.0 - ssim_loss_fn(image, image_gt)).mean().float()
-            # Downscale for LPIPS to avoid OOM
-            def _resize_hwc(img_hwc: torch.Tensor, max_side: int = 512):
-                H, W, C = img_hwc.shape
-                if max(H, W) <= max_side:
-                    return img_hwc
-                scale = max_side / max(H, W)
-                new_h = max(1, int(H * scale))
-                new_w = max(1, int(W * scale))
-                chw = img_hwc.permute(2,0,1)[None]
-                chw = F.interpolate(chw, size=(new_h, new_w), mode='area')
-                return chw[0].permute(1,2,0)
-            img_lp = _resize_hwc(image)
-            gt_lp = _resize_hwc(image_gt)
-            lpips_sum += lpips_loss_fn(img_lp, gt_lp).mean().float()
+            lpips_sum += lpips_loss_fn(image, image_gt).mean().float()
             num += 1
         except Exception as e:
             if num == 0:

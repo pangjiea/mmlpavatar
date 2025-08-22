@@ -6,6 +6,7 @@ import urllib.request
 from torch.nn.functional import l1_loss
 from torchmetrics.functional.image import peak_signal_noise_ratio, structural_similarity_index_measure
 from torchmetrics.image import LearnedPerceptualImagePatchSimilarity
+from torch.cuda.amp import autocast
 
 from scene.gaussian_model import GaussianModel
 
@@ -33,7 +34,7 @@ def lpips_loss(img1, img2):
     if lpips_model is None:
         try:
             # Try normal SSL verification first
-            lpips_model = LearnedPerceptualImagePatchSimilarity(net_type='vgg', normalize=True).cuda()
+            lpips_model = LearnedPerceptualImagePatchSimilarity(net_type='vgg', normalize=True).cuda().eval()
         except (ssl.SSLError, urllib.error.URLError) as e:
             print(f"SSL error when downloading VGG model: {e}")
             print("Attempting download with SSL verification disabled...")
@@ -41,14 +42,24 @@ def lpips_loss(img1, img2):
             old_context = ssl._create_default_https_context
             ssl._create_default_https_context = ssl._create_unverified_context
             try:
-                lpips_model = LearnedPerceptualImagePatchSimilarity(net_type='vgg', normalize=True).cuda()
+                lpips_model = LearnedPerceptualImagePatchSimilarity(net_type='vgg', normalize=True).cuda().eval()
                 print("Successfully downloaded VGG model with SSL verification disabled")
             finally:
                 # Restore SSL context
                 ssl._create_default_https_context = old_context
         
         for p in lpips_model.parameters(): p.requires_grad = False
-    loss = lpips_model(img1, img2)
+    # Reduce memory via autocast; fallback to CPU if OOM
+    try:
+        with autocast(device_type='cuda', dtype=torch.float16):
+            loss = lpips_model(img1, img2)
+    except torch.cuda.OutOfMemoryError:
+        torch.cuda.empty_cache()
+        dev = img1.device
+        lpips_model_cpu = lpips_model.to('cpu')
+        loss = lpips_model_cpu(img1.cpu(), img2.cpu()).float()
+        lpips_model.to(dev)
+        loss = loss.to(dev)
     return loss
 
 def dxyz_smooth_loss(gaussians: GaussianModel):
