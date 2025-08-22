@@ -96,11 +96,33 @@ class Scene:
             raise FileNotFoundError(f"权重网格文件不存在: {weights_grid_path}\n"
                                    f"请先运行: python script/gen_weight_volume.py --data_dir {args.data_dir} 来生成权重文件")
         grid_info = dict(np.load(weights_grid_path, allow_pickle=True))
+        # Validate LBS grid channels vs SMPL-X joint count
+        try:
+            grid_shape = grid_info['grid'].shape  # (X, Y, Z, P)
+            P_grid = int(grid_shape[-1])
+        except Exception:
+            raise RuntimeError(f"无法读取 LBS 网格通道数，文件格式异常: {weights_grid_path}")
 
+        P_model = int(len(smpl.model.parents))
+        if P_grid != P_model:
+            raise RuntimeError(
+                f"LBS权重网格关节数({P_grid}) 与 SMPL-X 模型关节数({P_model}) 不匹配。\n"
+                f"请重新生成权重文件以包含与当前模型一致的关节集合（含下颌/眼等）：\n"
+                f"  python script/gen_weight_volume.py --data_dir {args.data_dir} --smpl_path {args.smpl_pkl_path}\n"
+                f"当前权重文件: {weights_grid_path}"
+            )
+        if P_grid <= 24:
+            print(
+                f"[警告] 检测到权重通道数为 {P_grid}，很可能不包含面部/手部关节，\n"
+                f"嘴部/眼部的几何驱动将受限。建议用 SMPL-X 权重重新生成 lbs_weights_grid.npz。"
+            )
+        print(P_grid)
         # initialize gaussian model
         scene_scale = trainset.get_scene_scale(args.data_dir) * 1.1
         tpose_model = smpl.model(betas=beta[None], body_pose=smpl.smpl_tpose[None,3*1:22*3])
-        t_joints = tpose_model.joints.detach().numpy()[0,:smpl.model.NUM_JOINTS+1]
+        # Ensure t_joints count matches joint_parents length exactly (e.g., 55 for SMPL-X)
+        num_joints = len(smpl.model.parents)
+        t_joints = tpose_model.joints.detach().numpy()[0, :num_joints]
         xyz_path = path.join(args.data_dir, 'gaussian/init_body_points.ply')
 
         temp_path = path.join(args.data_dir, 'gaussian/template.ply')

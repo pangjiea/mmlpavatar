@@ -273,6 +273,14 @@ class GaussianModel:
         parent = self.joint_parents.cpu().numpy()
         Ac_inv = self.Ac_inv.cpu().numpy()
 
+        # Sanity checks to ensure pose/joints/parents alignment (e.g., 55 for SMPL-X)
+        nj_pose = pose.reshape(-1, 3).shape[0]
+        nj_joint = joints.shape[0]
+        nj_parent = len(parent)
+        assert nj_pose == nj_parent, f"smpl_poses joints ({nj_pose}) != parents ({nj_parent})"
+        assert nj_joint == nj_parent, f"t_joints ({nj_joint}) != parents ({nj_parent})"
+        assert Ac_inv.shape[0] == nj_parent, f"Ac_inv joints ({Ac_inv.shape[0]}) != parents ({nj_parent})"
+
         rots = Rotation.from_rotvec(pose.reshape(-1,3)).as_matrix().astype(np.float32)
         A = rigid_transform_numba(rots, joints, parent)
         G = np.matmul(A, Ac_inv)

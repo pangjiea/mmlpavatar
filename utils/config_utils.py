@@ -65,3 +65,17 @@ class Config:
     # iteration to start optimize the basis
     iteration_dxyz_basis = 2000
     iteration_gsparam_basis = 2000
+
+    # face-region loss
+    enable_face_loss = True
+    lambda_face_l1 = 0.0
+    lambda_face_lpips = 0.0
+    face_mask_method = 'smplx'  # 'heuristic' | 'smplx' | 'detector'
+    face_roi_top_frac = 0.15      # fraction from top of person bbox to start ROI
+    face_roi_height_frac = 0.22   # fraction of person bbox height for ROI height
+    face_roi_width_frac = 0.35    # fraction of person bbox width for ROI width
+    face_min_size = 32            # minimum face bbox size in pixels
+    # smplx mask params
+    face_smplx_radius_scale = 2.2  # multiplier on neck-head distance to set ROI radius
+    face_smplx_ax_min_frac = 0.25  # fraction along neck-head axis to start selecting verts
+    face_smplx_ax_max_frac = 2.0   # fraction along neck-head axis to stop selecting verts
