@@ -251,7 +251,7 @@ def testing_dataset(gaussians: GaussianModel, out_dir, dataset, background):
     except Exception as e:
         print(f"[info] FID unavailable, skipping: {e}")
 
-    for cam in tqdm(test_dataloader):
+    for cam in tqdm(test_dataloader, desc="Eval(metrics)"):
         cam = data_to_cam(cam, non_blocking=False)
         frame_id = cam['frame_id']
         gaussians.smpl_poses = cam['pose'].float()

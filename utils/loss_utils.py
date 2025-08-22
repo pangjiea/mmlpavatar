@@ -51,6 +51,9 @@ def lpips_loss(img1, img2):
         for p in lpips_model.parameters(): p.requires_grad = False
     # Reduce memory via autocast; fallback to CPU if OOM
     try:
+        # Proactively free cache to reduce risk of fallback
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         # Use torch.amp.autocast('cuda', ...) per PyTorch 2.x recommendation
         with amp.autocast("cuda", dtype=torch.float16):
             loss = lpips_model(img1, img2)

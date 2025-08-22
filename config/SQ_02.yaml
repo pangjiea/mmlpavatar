@@ -25,7 +25,7 @@ test:
   image_scaling: 1
 
 # optimization
-iterations: 20_000
+iterations: 3_0
 position_lr: 0.00016
 opacity_lr: 0.0005
 scaling_lr: 0.0005
@@ -51,6 +51,6 @@ num_verts: 10000
 num_features: 300
 
 # iteration to start optimize the basis
-iteration_dxyz_basis: 2000
-iteration_gsparam_basis: 2000
+iteration_dxyz_basis: 20
+iteration_gsparam_basis: 20
 

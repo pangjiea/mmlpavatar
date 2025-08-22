@@ -322,6 +322,7 @@ def training_report(scene: Scene, gaussians: GaussianModel, iteration, test_iter
         )
 
         cam_num = 0
+        pbar = tqdm(total=len(test_dataloader), desc="Eval(metrics)", leave=False)
         for cam in test_dataloader:
             cam = data_to_cam(cam, non_blocking=False)
             gaussians.smpl_poses = cam['pose']
@@ -369,6 +370,7 @@ def training_report(scene: Scene, gaussians: GaussianModel, iteration, test_iter
                 except Exception as e:
                     print(f"[info] FID update failed for a sample: {e}")
             cam_num += 1
+            pbar.update(1)
 
             if cam['idx'] in write_idxs:
                 frame_id, cam_id = cam['frame_id'], cam['cam_id']
@@ -376,6 +378,7 @@ def training_report(scene: Scene, gaussians: GaussianModel, iteration, test_iter
                 if iteration == test_iterations[0]:
                     tb_writer.add_images(f'train_view_{cam_id:02d}_{frame_id:06d}/ground_truth', image_gt.permute(2,0,1)[None], global_step=iteration)
 
+        pbar.close()
         psnr_test /= cam_num
         l1_test /= cam_num
         if ssim_test != 0:
