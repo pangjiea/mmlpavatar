@@ -605,63 +605,82 @@ class GaussianModel:
         self.init()
 
     def training_setup(self, args: Config, scene_scale):
-        eps=1e-15 
-        betas = (1 - 1 * (1 - 0.9), 1 - 1 * (1 - 0.999))
-        decay = 0.001
-
-        optimizers = {
-            'dxyz': Adam([self.dxyz_vt], args.position_lr * scene_scale, betas, eps),
-            'scales': Adam([self._scaling], args.scaling_lr, betas, eps),
-            'quats': Adam([self._rotation], args.rotation_lr, betas, eps),
-            'opacities': Adam([self._opacity], args.opacity_lr, betas, eps),
-            'sh0': Adam([self._sh0], args.color_lr, betas, eps),
-            'shN': Adam([self._shN], args.color_lr / 20, betas, eps),
-
-            'dxyz_bs': Adam([self.dxyz_bs], args.position_lr * scene_scale / 10, betas, eps),
-            'dscales_bs': Adam([self.scaling_bs], args.scaling_lr / 5, betas, eps),
-            'dquats_bs': Adam([self.rotation_bs], args.rotation_lr / 5, betas, eps),
-            'dopacities_bs': Adam([self.opacity_bs], args.opacity_lr / 5, betas, eps),
-            'dsh0_bs': Adam([self.sh0_bs], args.color_lr / 5, betas, eps),
-            'dshN_bs': Adam([self.shN_bs], args.color_lr / 200, betas, eps),
-
-            'encoder_feat_params': AdamW(self.encoder_feat_params.values(), args.encoder_lr, betas, eps, decay),
-
-            'xyz_offset': Adam([self.xyz_offset], args.xyz_offset_lr, betas, eps),
-            # SSS: degree/negative (Adam by default; can switch to SGHMC externally)
-            'degree': Adam([self._degree], getattr(args, 'degree_lr', 5e-4), betas, eps),
-            'negative': Adam([self._negative], getattr(args, 'negative_lr', 1e-4), betas, eps),
-        }
-
-        schedulers = [
-            ExponentialLR(optimizers['dxyz'], gamma=0.01 ** (1.0 / args.iterations)),
-            ExponentialLR(optimizers['scales'], gamma=0.1 ** (1.0 / args.iterations)),
-            ExponentialLR(optimizers['quats'], gamma=0.1 ** (1.0 / args.iterations)),
-            ExponentialLR(optimizers['opacities'], gamma=0.1 ** (1.0 / args.iterations)),
-            ExponentialLR(optimizers['sh0'], gamma=0.1 ** (1.0 / args.iterations)),
-            ExponentialLR(optimizers['shN'], gamma=0.1 ** (1.0 / args.iterations)),
-
-            ExponentialLR(optimizers['dxyz_bs'], gamma=0.1 ** (1.0 / args.iterations)),
-            ExponentialLR(optimizers['encoder_feat_params'], gamma=0.1 ** (1.0 / args.iterations)),
-
-            ExponentialLR(optimizers['xyz_offset'], gamma=0.1 ** (1.0 / args.iterations)),
-        ]
-
-        self.optimizers = optimizers
-        self.schedulers = schedulers
-
-        # Optional SSS SGHMC optimizer for xyz-like updates (use xyz_offset as position variable)
-        if getattr(args, 'optimizer', 'adam') == 'sghmc':
-            sghmc_params = [
-                {'params': [self.xyz_offset], 'lr': args.position_lr * scene_scale, 'name': 'xyz', 'mdecay': 1.3e2, 'mdecay_burnin': 5e3, 'burnin_iterations': 7000},
+        use_sghmc = getattr(args, 'optimizer', 'adam') == 'sghmc'
+        self.optimizers, self.schedulers = None, None
+        if use_sghmc:
+            # Full SSS-style optimizer: one AdamSGHMC manages all groups; 'xyz' uses SGHMC, others get Adam-like updates
+            C_burnin = getattr(args, 'C_burnin', 5e3)
+            C = getattr(args, 'C', 1.3e2)
+            burnin_iterations = getattr(args, 'burnin_iterations', 7000)
+            param_groups = [
+                {'params': [self.xyz_offset], 'lr': args.position_lr * scene_scale, 'name': 'xyz', 'mdecay': C, 'mdecay_burnin': C_burnin, 'burnin_iterations': burnin_iterations, 'scale_grad': 1.0},
+                {'params': [self._scaling], 'lr': args.scaling_lr, 'name': 'scaling'},
+                {'params': [self._rotation], 'lr': args.rotation_lr, 'name': 'rotation'},
+                {'params': [self._opacity], 'lr': args.opacity_lr, 'name': 'opacity'},
+                {'params': [self._sh0], 'lr': args.color_lr, 'name': 'f_dc'},
+                {'params': [self._shN], 'lr': args.color_lr / 20.0, 'name': 'f_rest'},
+                {'params': [self._degree], 'lr': getattr(args, 'degree_lr', 5e-4), 'name': 'degree'},
+                {'params': [self._negative], 'lr': getattr(args, 'negative_lr', 1e-4), 'name': 'negative'},
+                {'params': [self.dxyz_vt], 'lr': args.position_lr * scene_scale / 10.0, 'name': 'dxyz_vt'},
+                {'params': [self.scaling_bs], 'lr': args.scaling_lr / 5.0, 'name': 'dscales_bs'},
+                {'params': [self.rotation_bs], 'lr': args.rotation_lr / 5.0, 'name': 'dquats_bs'},
+                {'params': [self.opacity_bs], 'lr': args.opacity_lr / 5.0, 'name': 'dopacities_bs'},
+                {'params': [self.sh0_bs], 'lr': args.color_lr / 5.0, 'name': 'dsh0_bs'},
+                {'params': [self.shN_bs], 'lr': args.color_lr / 200.0, 'name': 'dshN_bs'},
             ]
-            self.sss_optimizer = AdamSGHMC(params=sghmc_params, eps=1e-15, scale_grad=1.0)
+            # Encoder params as one group
+            if self.encoder_feat_params is not None:
+                param_groups.append({'params': list(self.encoder_feat_params.values()), 'lr': args.encoder_lr, 'name': 'encoder'})
+            self.sss_optimizer = AdamSGHMC(params=param_groups, eps=1e-15, scale_grad=1.0)
+        else:
+            # Fallback to original Adam + schedulers (kept for compatibility)
+            eps=1e-15 
+            betas = (1 - 1 * (1 - 0.9), 1 - 1 * (1 - 0.999))
+            decay = 0.001
+            optimizers = {
+                'dxyz': Adam([self.dxyz_vt], args.position_lr * scene_scale, betas, eps),
+                'scales': Adam([self._scaling], args.scaling_lr, betas, eps),
+                'quats': Adam([self._rotation], args.rotation_lr, betas, eps),
+                'opacities': Adam([self._opacity], args.opacity_lr, betas, eps),
+                'sh0': Adam([self._sh0], args.color_lr, betas, eps),
+                'shN': Adam([self._shN], args.color_lr / 20, betas, eps),
+                'dxyz_bs': Adam([self.dxyz_bs], args.position_lr * scene_scale / 10, betas, eps),
+                'dscales_bs': Adam([self.scaling_bs], args.scaling_lr / 5, betas, eps),
+                'dquats_bs': Adam([self.rotation_bs], args.rotation_lr / 5, betas, eps),
+                'dopacities_bs': Adam([self.opacity_bs], args.opacity_lr / 5, betas, eps),
+                'dsh0_bs': Adam([self.sh0_bs], args.color_lr / 5, betas, eps),
+                'dshN_bs': Adam([self.shN_bs], args.color_lr / 200, betas, eps),
+                'encoder_feat_params': AdamW(self.encoder_feat_params.values(), args.encoder_lr, betas, eps, decay),
+                'xyz_offset': Adam([self.xyz_offset], args.xyz_offset_lr, betas, eps),
+                'degree': Adam([self._degree], getattr(args, 'degree_lr', 5e-4), betas, eps),
+                'negative': Adam([self._negative], getattr(args, 'negative_lr', 1e-4), betas, eps),
+            }
+            schedulers = [
+                ExponentialLR(optimizers['dxyz'], gamma=0.01 ** (1.0 / args.iterations)),
+                ExponentialLR(optimizers['scales'], gamma=0.1 ** (1.0 / args.iterations)),
+                ExponentialLR(optimizers['quats'], gamma=0.1 ** (1.0 / args.iterations)),
+                ExponentialLR(optimizers['opacities'], gamma=0.1 ** (1.0 / args.iterations)),
+                ExponentialLR(optimizers['sh0'], gamma=0.1 ** (1.0 / args.iterations)),
+                ExponentialLR(optimizers['shN'], gamma=0.1 ** (1.0 / args.iterations)),
+                ExponentialLR(optimizers['dxyz_bs'], gamma=0.1 ** (1.0 / args.iterations)),
+                ExponentialLR(optimizers['encoder_feat_params'], gamma=0.1 ** (1.0 / args.iterations)),
+                ExponentialLR(optimizers['xyz_offset'], gamma=0.1 ** (1.0 / args.iterations)),
+            ]
+            self.optimizers = optimizers
+            self.schedulers = schedulers
 
     def optimizer_step(self):
-        for optimizer in self.optimizers.values():
-            optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
-        for scheduler in self.schedulers:
-            scheduler.step()
+        # If using SSS optimizer, the step is handled in train loop (needs sig & cov). No-op here.
+        if self.sss_optimizer is not None:
+            self.cache_dict = {}
+            return
+        if self.optimizers is not None:
+            for optimizer in self.optimizers.values():
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+        if self.schedulers is not None:
+            for scheduler in self.schedulers:
+                scheduler.step()
         self.cache_dict = {}
 
     def render(self, cam, override_color=None, scaling_modifier=1.0, background=None):
