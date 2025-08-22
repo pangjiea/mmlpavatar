@@ -29,7 +29,10 @@ def convert_smplx_to_npz(data_dir):
     transl_list = []
     expression_list = []
     jaw_pose_list = []
-    
+    leye_pose_list = []
+    reye_pose_list = []
+    Rh_list = []
+    Th_list = []
     print(f"转换 {len(json_files)} 个文件...")
     
     for json_file in json_files:
@@ -44,11 +47,13 @@ def convert_smplx_to_npz(data_dir):
         left_hand_pose = np.array(data['left_hand_pose'][0]).astype(np.float32)
         right_hand_pose = np.array(data['right_hand_pose'][0]).astype(np.float32)
         transl = np.array(data['transl'][0]).astype(np.float32)
-        
+        Rh = np.array(data['Rh'][0]).astype(np.float32) if 'Rh' in data else np.zeros((3,), dtype=np.float32)
+        Th = np.array(data['Th'][0]).astype(np.float32) if 'Th' in data else np.zeros((3,), dtype=np.float32)
         # SMPL-X特有的参数
         expression = np.array(data['expression'][0]).astype(np.float32)
         jaw_pose = np.array(data['jaw_pose'][0]).astype(np.float32)
-        
+        leye_pose = np.array(data['leye_pose'][0]).astype(np.float32)
+        reye_pose = np.array(data['reye_pose'][0]).astype(np.float32)
         global_orient_list.append(global_orient)
         body_pose_list.append(body_pose)
         left_hand_pose_list.append(left_hand_pose)
@@ -56,17 +61,24 @@ def convert_smplx_to_npz(data_dir):
         transl_list.append(transl)
         expression_list.append(expression)
         jaw_pose_list.append(jaw_pose)
+        leye_pose_list.append(leye_pose)
+        reye_pose_list.append(reye_pose)
     
     # 转换为numpy数组
     smpl_params = {
         'betas': betas,  # (1, 300)
         'global_orient': np.array(global_orient_list),  # (N, 3)
         'body_pose': np.array(body_pose_list),  # (N, 63)
+        'jaw_pose': np.array(jaw_pose_list),  # (N, 3)
+        'leye_pose': np.array(leye_pose_list),  # (N, 3)
+        'reye_pose': np.array(leye_pose_list),  # (N, 3)
         'left_hand_pose': np.array(left_hand_pose_list),  # (N, 45)
         'right_hand_pose': np.array(right_hand_pose_list),  # (N, 45)
         'transl': np.array(transl_list),  # (N, 3)
-        'expression': np.array(expression_list),  # (N, 50)
+        'expression': np.array(expression_list),  # (N, 10)
         'jaw_pose': np.array(jaw_pose_list),  # (N, 3)
+        'Rh': np.array(Rh_list),  # (N, 3)
+        'Th': np.array(Th_list)   # (N, 3)
     }
     
     # 保存为NPZ文件
@@ -84,7 +96,11 @@ def merge_json_to_npz(data_dir):
     
     # 获取所有JSON文件
     json_files = sorted([f for f in os.listdir(smplx_dir) if f.endswith('.json')])
-    
+    print(f"找到 {len(json_files)} 个 JSON 文件")
+    print(f"SMPLX目录: {smplx_dir}")
+    print(f"数据目录: {data_dir}")
+    print(f"JSON文件列表: {json_files}")
+
     if not json_files:
         print("未找到SMPL-X JSON文件")
         return
@@ -102,8 +118,6 @@ def merge_json_to_npz(data_dir):
         
         for key, value in data.items():
             # 将body_pose重命名为pose
-            if key == 'body_pose':
-                key = 'pose'
             
             if key not in smpl_params:
                 smpl_params[key] = []
@@ -122,5 +136,5 @@ def merge_json_to_npz(data_dir):
         print(f"  {key}: {value.shape}")
 
 if __name__ == "__main__":
-    data_dir = "/home/hello/data/SQ_02"
+    data_dir = "/home/hello/data/SC_01"
     merge_json_to_npz(data_dir)

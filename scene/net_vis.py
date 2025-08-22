@@ -34,6 +34,7 @@ def load_pose_list(file_path):
             pose['expression'] = np.array(pose['expression']).astype(np.float32)
             has_expression = True
         else:
+            print('expression not found in pose, using default zeros')
             pose['expression'] = np.zeros(10, dtype=np.float32)
     
     if has_expression:
