@@ -38,6 +38,8 @@ class Config:
 
     # optimization
     iterations = 800_000
+    optimizer = 'adam'           # 'adam' | 'sghmc'
+    renderer = 'gsplat'          # 'gsplat' | 'sss'
     position_lr = 0.00016
     opacity_lr = 0.0005
     scaling_lr = 0.0005
@@ -45,6 +47,8 @@ class Config:
     color_lr = 0.0005
     xyz_offset_lr = 0.001
     encoder_lr = 0.0005
+    degree_lr = 5e-4             # SSS degree nu lr
+    negative_lr = 1e-4           # SSS negative lr
 
     iteration_sh_degree = 250000
 
@@ -55,6 +59,9 @@ class Config:
     lambda_scaling = 0.1
     scaling_threshold = 0.01
     lambda_dxyz_smooth = 0.1
+    # SSS regularization (optional)
+    sss_scale_reg = 0.0
+    sss_opacity_reg = 0.0
     
     init_num_gs = 200_000
 

@@ -10,6 +10,7 @@ from torch.optim import Adam, AdamW
 from torch.optim.lr_scheduler import ExponentialLR
 from pytorch3d.ops import knn_points
 from gsplat import rasterization, quat_scale_to_covar_preci, spherical_harmonics
+from utils.sss_sghmc import AdamSGHMC
 
 def axis_angle_to_matrix(axis_angle: torch.Tensor) -> torch.Tensor:
     """
@@ -123,6 +124,7 @@ class GaussianModel:
         # optimizer
         self.optimizers = None
         self.schedulers = None
+        self.sss_optimizer = None
 
         # SSS additions
         self._degree = torch.empty(0)
@@ -647,13 +649,19 @@ class GaussianModel:
         self.optimizers = optimizers
         self.schedulers = schedulers
 
+        # Optional SSS SGHMC optimizer for xyz-like updates (use xyz_offset as position variable)
+        if getattr(args, 'optimizer', 'adam') == 'sghmc':
+            sghmc_params = [
+                {'params': [self.xyz_offset], 'lr': args.position_lr * scene_scale, 'name': 'xyz', 'mdecay': 1.3e2, 'mdecay_burnin': 5e3, 'burnin_iterations': 7000},
+            ]
+            self.sss_optimizer = AdamSGHMC(params=sghmc_params, eps=1e-15, scale_grad=1.0)
+
     def optimizer_step(self):
         for optimizer in self.optimizers.values():
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
         for scheduler in self.schedulers:
             scheduler.step()
-        
         self.cache_dict = {}
 
     def render(self, cam, override_color=None, scaling_modifier=1.0, background=None):

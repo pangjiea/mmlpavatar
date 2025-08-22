@@ -194,6 +194,18 @@ def training(args: Config):
 
         loss.backward()
 
+        # Optional SSS: add simple regularizers before SGHMC step
+        if gaussians.renderer_backend == 'sss':
+            def cfg(key, default):
+                v = OmegaConf.select(args, key)
+                return default if v is None else v
+            scale_reg = cfg('sss_scale_reg', 0.0)
+            opacity_reg = cfg('sss_opacity_reg', 0.0)
+            if scale_reg > 0:
+                (scale_reg * torch.abs(gaussians.get_cano_scaling).mean()).backward()
+            if opacity_reg > 0:
+                (opacity_reg * torch.abs(gaussians.get_opacity).mean()).backward()
+
         # log part
         ema_vis_loss = 0.4 * l1loss.item() + 0.6 * ema_vis_loss
         ema_lpips_loss = 0.4 * lpipsloss.item() + 0.6 * ema_lpips_loss
@@ -211,6 +223,19 @@ def training(args: Config):
         training_report(scene, gaussians, iteration, args.test_iterations, loss_dict, background)
 
         # optimizer step
+        # Apply SGHMC to xyz-like params if enabled
+        if gaussians.renderer_backend == 'sss' and getattr(args, 'optimizer', 'adam') == 'sghmc' and gaussians.sss_optimizer is not None:
+            try:
+                # Sharp sigmoid near 0.995 as in SSS
+                def op_sigmoid(x, k=100.0, x0=0.995):
+                    return 1.0 / (1.0 + torch.exp(-k * (x - x0)))
+                sig = op_sigmoid(1.0 - torch.abs(gaussians.get_opacity)).unsqueeze(-1).expand(-1, 3)
+                cov = gaussians.get_covariance
+                gaussians.sss_optimizer.step(sig=sig.detach(), cov=cov.detach())
+                gaussians.sss_optimizer.zero_grad(set_to_none=True)
+            except Exception as e:
+                print(f"[warn] SGHMC step failed: {e}")
+
         gaussians.optimizer_step()
 
         if iteration == args.iteration_dxyz_basis:
