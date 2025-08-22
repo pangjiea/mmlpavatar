@@ -44,6 +44,11 @@ def training(args: Config):
     gaussians = GaussianModel()
     scene = Scene(args, gaussians)    
     gaussians.training_setup(args, scene.scene_scale)
+    # Select renderer backend if provided (default: gsplat)
+    try:
+        gaussians.renderer_backend = OmegaConf.select(args, 'renderer') or 'gsplat'
+    except Exception:
+        gaussians.renderer_backend = 'gsplat'
 
     visualizer = Visualizer(in_training=True)
     visualizer.net_init(args.ip, args.port)

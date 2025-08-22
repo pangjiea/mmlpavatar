@@ -64,6 +64,10 @@ class GaussianModel:
         self.color_activation = torch.sigmoid
         self.inverse_color_activation = torch.logit
 
+        # SSS: degree of freedom activation (clamped to [1, 10000])
+        from torch import nn as _nn
+        self.nu_degree_activation = _nn.Hardtanh(1, 10000)
+
     def __init__(self):
 
         self._xyz = torch.empty(0)
@@ -120,6 +124,11 @@ class GaussianModel:
         self.optimizers = None
         self.schedulers = None
 
+        # SSS additions
+        self._degree = torch.empty(0)
+        self._negative = torch.empty(0)
+        # Render backend: 'gsplat' (default) or 'sss'
+        self.renderer_backend = 'gsplat'
         # knn
         self.nbr_gs = torch.empty(0)
         self.nbr_gs_invdist = torch.empty(0)
@@ -182,6 +191,10 @@ class GaussianModel:
 
             'is_dxyz_bs': self.is_dxyz_bs,
             'is_gsparam_bs': self.is_gsparam_bs,
+
+            # SSS
+            '_degree': self._degree,
+            '_negative': self._negative,
         }
         return data
     
@@ -538,6 +551,14 @@ class GaussianModel:
         self._sh0 = nn.Parameter(sh0.requires_grad_(True))
         self._shN = nn.Parameter(shN.requires_grad_(True))
 
+        # SSS: initialize degree (nu) and negative (learnable as requested)
+        nu_init = 10.0
+        negative_init = 1.0
+        degree = torch.full((N, 1), float(nu_init), dtype=torch.float32, device=xyz.device)
+        negative = torch.full((N, 1), float(negative_init), dtype=torch.float32, device=xyz.device)
+        self._degree = nn.Parameter(degree.requires_grad_(True))
+        self._negative = nn.Parameter(negative.requires_grad_(True))
+
         self.t_joints = torch.as_tensor(t_joints).detach().float().cpu()
         self.joint_parents = torch.as_tensor(joint_parents).detach().cpu()
 
@@ -604,6 +625,9 @@ class GaussianModel:
             'encoder_feat_params': AdamW(self.encoder_feat_params.values(), args.encoder_lr, betas, eps, decay),
 
             'xyz_offset': Adam([self.xyz_offset], args.xyz_offset_lr, betas, eps),
+            # SSS: degree/negative (Adam by default; can switch to SGHMC externally)
+            'degree': Adam([self._degree], getattr(args, 'degree_lr', 5e-4), betas, eps),
+            'negative': Adam([self._negative], getattr(args, 'negative_lr', 1e-4), betas, eps),
         }
 
         schedulers = [
@@ -633,28 +657,34 @@ class GaussianModel:
         self.cache_dict = {}
 
     def render(self, cam, override_color=None, scaling_modifier=1.0, background=None):
-        sh = self.get_sh      # can be faster
-        covars = self.get_covariance(scaling_modifier)
-        if override_color is None:
-            cam_pos = torch.linalg.inv_ex(cam['w2c'])[0][:3,3]
-            override_color = self.get_color(cam_pos)
-        
-        image, alpha, info = rasterization(
-            means=self.get_xyz,
-            quats=None,
-            scales=None,
-            opacities=self.get_opacity,
-            colors=override_color,
-            viewmats=cam['w2c'][None],  # [1, 4, 4]
-            Ks=cam['K'][None],  # [1, 3, 3]
-            width=cam['width'],
-            height=cam['height'],
-            packed=False,
-            near_plane=0.1,
-            backgrounds=background[None],  # [1, 3]
-            covars=covars,
-        )
-        return image[0], alpha[0], info
+        if self.renderer_backend == 'sss':
+            from render.sss_adapter import render_sss
+            image, alpha, info = render_sss(cam, self, background, compute_cov3D_python=True)
+            # Adapter returns full image tensor; keep interface consistent
+            return image, alpha, info
+        else:
+            sh = self.get_sh      # can be faster
+            covars = self.get_covariance(scaling_modifier)
+            if override_color is None:
+                cam_pos = torch.linalg.inv_ex(cam['w2c'])[0][:3,3]
+                override_color = self.get_color(cam_pos)
+            
+            image, alpha, info = rasterization(
+                means=self.get_xyz,
+                quats=None,
+                scales=None,
+                opacities=self.get_opacity,
+                colors=override_color,
+                viewmats=cam['w2c'][None],  # [1, 4, 4]
+                Ks=cam['K'][None],  # [1, 3, 3]
+                width=cam['width'],
+                height=cam['height'],
+                packed=False,
+                near_plane=0.1,
+                backgrounds=background[None],  # [1, 3]
+                covars=covars,
+            )
+            return image[0], alpha[0], info
 
     def init_body(self):
         # Rots = batch_rodrigues(smpl.smpl_bigpose.reshape(-1,3)).cuda()
@@ -712,6 +742,15 @@ class GaussianModel:
     def Th(self, value):
         self.cache_dict = {}  # 清空缓存，因为Th改变了
         self._Th = value.cuda(non_blocking=True)
+
+    @property
+    def get_nu_degree(self):
+        # Map raw degree to [1, 10000]
+        return self.nu_degree_activation(self._degree)
+
+    @property
+    def get_negative(self):
+        return self._negative
 
     def prepare_interpolating_weights(self, xyz_ft, xyz_vt):
         self.xyz_vt = xyz_vt
