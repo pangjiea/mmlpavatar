@@ -130,7 +130,8 @@ def load_amass_pose_list(pose_path):
     trans = data['trans'].astype(np.float32)
     N = len(poses)
 
-    OPTIMIZE_AMASS = True
+    # Keep behavior consistent with test.py (no extra filtering/smoothing)
+    OPTIMIZE_AMASS = False
     if OPTIMIZE_AMASS:
         foo = poses[:,3:]
         foo[:, 13 * 3 + 2] -= 0.25
@@ -160,21 +161,54 @@ def load_amass_pose_list(pose_path):
     return pose_list
 
 def load_thuman_pose_list(pose_path):
+    """Load SMPL params (e.g., smpl_params.npz) with expression/jaw/eye preserved.
+    Matches test.py's load_smpl_params_with_rhth semantics.
+    """
     smpl_params = np.load(pose_path, allow_pickle=True)
     smpl_params = dict(smpl_params)
 
+    # Determine frame count robustly
+    if 'Rh' in smpl_params:
+        N = len(smpl_params['Rh'])
+    elif 'Th' in smpl_params:
+        N = len(smpl_params['Th'])
+    elif 'global_orient' in smpl_params:
+        N = len(smpl_params['global_orient'])
+    else:
+        raise ValueError('无法确定帧数，SMPL参数文件中缺少Rh、Th或global_orient')
+
     pose_list = []
-    N = len(smpl_params['global_orient'])
     for frame_id in range(N):
-        pose = np.concatenate([smpl_params['global_orient'][frame_id],
-                    smpl_params['body_pose'][frame_id],
-                    np.zeros(3,dtype=np.float32),
-                    np.zeros(6,dtype=np.float32),
-                    smpl_params['left_hand_pose'][frame_id],
-                    smpl_params['right_hand_pose'][frame_id],], axis=0)
-        Th = smpl_params['transl'][frame_id]
-        Rh = np.eye(3, dtype=np.float32)
-        pose_list.append(dict(pose=pose, Th=Th, Rh=Rh))
+        global_orient = smpl_params['global_orient'][frame_id] if 'global_orient' in smpl_params else np.zeros(3, dtype=np.float32)
+        body_pose = smpl_params['body_pose'][frame_id]
+        jaw_pose = smpl_params.get('jaw_pose', np.zeros((N,3), dtype=np.float32))[frame_id]
+        leye_pose = smpl_params.get('leye_pose', np.zeros((N,3), dtype=np.float32))[frame_id]
+        reye_pose = smpl_params.get('reye_pose', np.zeros((N,3), dtype=np.float32))[frame_id]
+        left_hand = smpl_params['left_hand_pose'][frame_id]
+        right_hand = smpl_params['right_hand_pose'][frame_id]
+
+        expression = smpl_params.get('expression', np.zeros((N,10), dtype=np.float32))[frame_id]
+        # Normalize expression to 10 dims float32
+        expression = np.asarray(expression, dtype=np.float32)
+        if expression.shape[0] > 10:
+            expression = expression[:10]
+        elif expression.shape[0] < 10:
+            expression = np.pad(expression, (0, 10 - expression.shape[0]))
+
+        pose = np.concatenate([
+            global_orient.astype(np.float32),
+            body_pose.astype(np.float32),
+            jaw_pose.astype(np.float32),
+            leye_pose.astype(np.float32),
+            reye_pose.astype(np.float32),
+            left_hand.astype(np.float32),
+            right_hand.astype(np.float32),
+        ], axis=0).astype(np.float32)
+
+        Th = smpl_params['Th'][frame_id].astype(np.float32) if 'Th' in smpl_params else smpl_params['transl'][frame_id].astype(np.float32)
+        Rh = smpl_params['Rh'][frame_id].astype(np.float32) if 'Rh' in smpl_params else np.eye(3, dtype=np.float32)
+
+        pose_list.append(dict(pose=pose, Th=Th, Rh=Rh, expression=expression))
     return pose_list
 
 class GUI:
@@ -344,6 +378,14 @@ class GUI:
         def callback_camera_id(sender, app_data):
             cam_info = self.camera_list[app_data]
             cam.load_cam_pose(cam_info['w2c'])
+            # Approximate intrinsics: match horizontal FOV to selected camera
+            try:
+                fx = float(cam_info['K'][0][0]) if isinstance(cam_info['K'], list) else float(cam_info['K'][0,0])
+                if fx > 1e-6:
+                    fovx = 2 * np.arctan(self.W / 2.0 / fx)
+                    cam.update_cam(fovx=fovx)
+            except Exception:
+                pass
 
         def callback_render_type(sender, app_data):
             self.render_type = app_data
