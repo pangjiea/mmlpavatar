@@ -219,6 +219,11 @@ class GUI:
         self.W = width
         self.image = None
         self.timer = 0
+        # Playback state
+        self.is_playing = False
+        self.playback_fps = 30.0
+        self.playback_acc = 0.0
+        self.play_source = 'train'  # 'train' or 'novel'
 
         self.scaling_modifier = 1.0
         self.camera_list = []
@@ -242,6 +247,41 @@ class GUI:
         self.is_transl = True
         self.is_test = True
         self.is_fist = False
+
+    # ----- helpers for frame setting -----
+    def set_train_frame(self, idx):
+        if len(self.pose_list) == 0:
+            return
+        idx = int(idx) % len(self.pose_list)
+        pose_info = self.pose_list[idx]
+        self.pose = pose_info['pose']
+        self.Rh = pose_info['Rh']
+        self.Th = pose_info['Th']
+        expr = pose_info.get('expression', None)
+        if expr is not None:
+            self.expression = np.array(expr, dtype=np.float32)
+        try:
+            dpg.set_value('frame_id', idx)
+        except Exception:
+            pass
+
+    def set_novel_frame(self, idx):
+        if len(self.novel_pose_list) == 0:
+            return
+        idx = int(idx) % len(self.novel_pose_list)
+        pose_info = self.novel_pose_list[idx]
+        self.pose = pose_info['pose']
+        self.Rh = pose_info['Rh']
+        self.Th = pose_info['Th']
+        if not self.is_transl:
+            self.Th = np.zeros_like(pose_info['Th'])
+        expr = pose_info.get('expression', None)
+        if expr is not None:
+            self.expression = np.array(expr, dtype=np.float32)
+        try:
+            dpg.set_value('novel_pose_frame_id', idx)
+        except Exception:
+            pass
 
     def gaussian_gui_info(self):
         info = self.cam.gaussian_cam_info()
@@ -318,6 +358,25 @@ class GUI:
 
             self.timer += elapsed_time
             dpg.set_value('timer', f'Timer: {self.timer:.2f}')
+
+            # playback step
+            if self.is_playing and self.playback_fps > 0:
+                self.playback_acc += elapsed_time
+                step = 1.0 / max(self.playback_fps, 1e-6)
+                while self.playback_acc >= step:
+                    self.playback_acc -= step
+                    if self.play_source == 'train' and len(self.pose_list) > 0:
+                        try:
+                            cur = int(dpg.get_value('frame_id'))
+                        except Exception:
+                            cur = 0
+                        self.set_train_frame(cur + 1)
+                    elif self.play_source == 'novel' and len(self.novel_pose_list) > 0:
+                        try:
+                            cur = int(dpg.get_value('novel_pose_frame_id'))
+                        except Exception:
+                            cur = 0
+                        self.set_novel_frame(cur + 1)
             if acc_time > 1: 
                 fps = frame_cnt / acc_time
                 dpg.set_value('fps', f'FPS: {fps:.1f} ')
@@ -391,13 +450,7 @@ class GUI:
             self.render_type = app_data
 
         def callback_frame_id(sender, app_data):
-            pose_info = self.pose_list[app_data]
-            self.pose = pose_info['pose']
-            self.Rh = pose_info['Rh']
-            self.Th = pose_info['Th']
-            expr = pose_info.get('expression', None)
-            if expr is not None:
-                self.expression = np.array(expr, dtype=np.float32)
+            self.set_train_frame(app_data)
 
         def callback_tpose(sender, app_data):
             self.pose = np.zeros(165, dtype=np.float32)
@@ -438,16 +491,24 @@ class GUI:
             dpg.configure_item('novel_pose_frame_id', max_value=len(self.novel_pose_list)-1)
 
         def callback_novel_frame_id(sender, app_data):
-            pose_info = self.novel_pose_list[app_data]
-            self.pose = pose_info['pose']
-            self.Rh = pose_info['Rh']
-            self.Th = pose_info['Th'] 
-            if not self.is_transl: 
-                self.Th = np.zeros_like(pose_info['Th'])
-            # 仅当 novel pose 含 expression 时才更新
-            expr = pose_info.get('expression', None)
-            if expr is not None:
-                self.expression = np.array(expr, dtype=np.float32)
+            self.set_novel_frame(app_data)
+
+        def callback_toggle_play(sender, app_data):
+            self.is_playing = not self.is_playing
+            self.playback_acc = 0.0
+            try:
+                dpg.configure_item('play_button', label=('Pause' if self.is_playing else 'Play'))
+            except Exception:
+                pass
+
+        def callback_fps(sender, app_data):
+            try:
+                self.playback_fps = float(app_data)
+            except Exception:
+                self.playback_fps = 30.0
+
+        def callback_play_source(sender, app_data):
+            self.play_source = app_data
 
         def callback_is_no_transl(sender, app_data):
             self.is_transl = not app_data
@@ -549,6 +610,10 @@ class GUI:
         with dpg.window(label='Frame', width=W_info, pos=[W+10, 700]):
             dpg.add_text('Training pose')
             dpg.add_slider_int(default_value=0, label='Frame id', tag='frame_id', min_value=0, max_value=0, callback=callback_frame_id)
+            with dpg.group(horizontal=True):
+                dpg.add_button(label='Play', tag='play_button', callback=callback_toggle_play)
+                dpg.add_slider_float(default_value=30.0, min_value=1.0, max_value=120.0, label='FPS', width=150, callback=callback_fps)
+                dpg.add_combo(['train','novel'], label='Source', default_value='train', callback=callback_play_source, width=80)
             
             dpg.add_text('Novel pose')
             dpg.add_slider_int(default_value=0, label='Frame id', tag='novel_pose_frame_id', min_value=0, max_value=0, callback=callback_novel_frame_id)
