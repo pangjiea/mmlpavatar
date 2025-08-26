@@ -14,8 +14,11 @@ Example usage::
         --npz_path path/to/motion.npz \
         --output_dir path/to/output/plys
 
-If ``--view_dependent`` is supplied, the script will compute
-view‑dependent colours using the default camera position (see below).
+Options:
+
+* ``--format standard|simple``: output PLY format (default: ``standard``).
+* ``--color_mode sh|position|opacity|uniform``: for ``simple`` format.
+* ``--view_dependent``: compute view‑dependent colours (forces simple PLY).
 
 The ``.npz`` file is expected to contain at least the following keys:
 
@@ -42,6 +45,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from scene.gaussian_model import GaussianModel  # type: ignore
+from utils.smpl_utils import init_smpl_pose  # ensure smpl.smpl_bigpose is available for restore()
 
 
 def _find_checkpoint(model_dir: str) -> str:
@@ -111,8 +115,45 @@ def _get_frame_count(motion: dict) -> int:
     return len(motion[first_key])
 
 
+def _compose_full_pose(motion: dict, idx: int) -> np.ndarray:
+    """Compose a 165-dim SMPL-X pose vector for frame ``idx``.
+
+    Order: [global_orient(3), body_pose(63), jaw(3), leye(3), reye(3),
+            left_hand(45), right_hand(45)] = 165.
+    Missing parts are padded with zeros.
+    If a 'pose' array of length 165 already exists, it is returned as-is.
+    """
+    # Direct 'pose' path
+    if 'pose' in motion:
+        pose = motion['pose'][idx]
+        if pose.shape[-1] == 165:
+            return pose.astype(np.float32)
+    # Collect components
+    def get(name, d):
+        return motion[name][idx] if name in motion else np.zeros(d, dtype=np.float32)
+    global_orient = get('global_orient', 3)
+    body_pose = motion['body_pose'][idx] if 'body_pose' in motion else (
+        motion['pose'][idx][3:3+63] if 'pose' in motion and motion['pose'][idx].shape[-1] >= 66 else np.zeros(63, dtype=np.float32)
+    )
+    jaw_pose = get('jaw_pose', 3)
+    leye_pose = get('leye_pose', 3)
+    reye_pose = get('reye_pose', 3)
+    left_hand = get('left_hand_pose', 45)
+    right_hand = get('right_hand_pose', 45)
+    parts = [global_orient, body_pose, jaw_pose, leye_pose, reye_pose, left_hand, right_hand]
+    pose = np.concatenate(parts, axis=0).astype(np.float32)
+    return pose
+
+
 def export_sequence(model_dir: str, npz_path: str, output_dir: str,
-                    view_dependent: bool = False) -> None:
+                    view_dependent: bool = False,
+                    ply_format: str = 'standard',
+                    color_mode: str = 'sh',
+                    scale_mode: str = 'auto',
+                    scale_factor: float = 1.0,
+                    scale_min: float | None = None,
+                    scale_max: float | None = None,
+                    opacity_mode: str = 'auto') -> None:
     """Export a sequence of PLY files from a Gaussian model.
 
     Args:
@@ -131,12 +172,19 @@ def export_sequence(model_dir: str, npz_path: str, output_dir: str,
     os.makedirs(output_dir, exist_ok=True)
 
     # Load Gaussian model from checkpoint
+    # Important: GaussianModel.restore() expects smpl.smpl_bigpose to be initialized.
+    # We don't need the full SMPL-X model here; init_smpl_pose() is sufficient.
+    init_smpl_pose()
     ckpt_path = _find_checkpoint(model_dir)
     print(f"Loading checkpoint: {ckpt_path}")
     gaussians = GaussianModel()
     load_data = torch.load(ckpt_path, weights_only=False)
     # `restore` populates the model parameters; it returns self
     gaussians.restore(load_data)
+    # Ensure encoder params are float32 to avoid dtype mismatch
+    if hasattr(gaussians, 'encoder_feat_params') and isinstance(gaussians.encoder_feat_params, dict):
+        for k in list(gaussians.encoder_feat_params.keys()):
+            gaussians.encoder_feat_params[k] = gaussians.encoder_feat_params[k].float()
 
     # The Gaussian model stores parameters on CPU by default; if CUDA is
     # available we move the model to GPU for faster computation.  This
@@ -154,33 +202,19 @@ def export_sequence(model_dir: str, npz_path: str, output_dir: str,
         print("No frames found in motion file.")
         return
 
-    # Determine key names for pose, rotation and translation
-    pose_key = None
-    if 'pose' in motion:
-        pose_key = 'pose'
-    elif 'body_pose' in motion:
-        pose_key = 'body_pose'
     # Keys for rotation and translation
     Rh_key = 'Rh' if 'Rh' in motion else ('global_orient' if 'global_orient' in motion else None)
     Th_key = 'Th' if 'Th' in motion else ('transl' if 'transl' in motion else None)
     # Optional facial parameters
     exp_key = 'expression' if 'expression' in motion else None
     jaw_key = 'jaw_pose' if 'jaw_pose' in motion else None
+    leye_key = 'leye_pose' if 'leye_pose' in motion else None
+    reye_key = 'reye_pose' if 'reye_pose' in motion else None
 
     for idx in range(n_frames):
-        # Set pose parameters
-        if pose_key is not None:
-            pose_np = motion[pose_key][idx]
-            # If using body_pose only (63 dims), prepend the global_orient to form 69 dims
-            if pose_key == 'body_pose':
-                if Rh_key is not None:
-                    global_orient = motion[Rh_key][idx]
-                else:
-                    global_orient = np.zeros(3, dtype=np.float32)
-                pose_np = np.concatenate([global_orient, pose_np], axis=0)
-            # Convert to torch tensor
-            pose_t = torch.from_numpy(pose_np).float()
-            gaussians.smpl_poses = pose_t
+        # Set full pose (165) to satisfy joint assertions in GaussianModel
+        pose_np = _compose_full_pose(motion, idx)
+        gaussians.smpl_poses = torch.from_numpy(pose_np).float()
 
         # Set global rotation (Rh)
         if Rh_key is not None:
@@ -198,11 +232,34 @@ def export_sequence(model_dir: str, npz_path: str, output_dir: str,
 
         # Facial parameters
         if exp_key is not None:
-            exp_np = motion[exp_key][idx]
+            exp_np = np.asarray(motion[exp_key][idx], dtype=np.float32).reshape(-1)
+            # Normalize to 10 dims to match training/config
+            if exp_np.shape[0] > 10:
+                exp_np = exp_np[:10]
+            elif exp_np.shape[0] < 10:
+                exp_np = np.pad(exp_np, (0, 10 - exp_np.shape[0]))
             gaussians.expression = torch.from_numpy(exp_np).float()
         if jaw_key is not None:
-            jaw_np = motion[jaw_key][idx]
+            jaw_np = np.asarray(motion[jaw_key][idx], dtype=np.float32).reshape(-1)
+            if jaw_np.shape[0] > 3:
+                jaw_np = jaw_np[:3]
+            elif jaw_np.shape[0] < 3:
+                jaw_np = np.pad(jaw_np, (0, 3 - jaw_np.shape[0]))
             gaussians.jaw_pose = torch.from_numpy(jaw_np).float()
+        if leye_key is not None:
+            leye_np = np.asarray(motion[leye_key][idx], dtype=np.float32).reshape(-1)
+            if leye_np.shape[0] > 3:
+                leye_np = leye_np[:3]
+            elif leye_np.shape[0] < 3:
+                leye_np = np.pad(leye_np, (0, 3 - leye_np.shape[0]))
+            gaussians.leye_pose = torch.from_numpy(leye_np).float()
+        if reye_key is not None:
+            reye_np = np.asarray(motion[reye_key][idx], dtype=np.float32).reshape(-1)
+            if reye_np.shape[0] > 3:
+                reye_np = reye_np[:3]
+            elif reye_np.shape[0] < 3:
+                reye_np = np.pad(reye_np, (0, 3 - reye_np.shape[0]))
+            gaussians.reye_pose = torch.from_numpy(reye_np).float()
 
         # Compute output filename
         fname = f"frame_{idx:04d}.ply"
@@ -214,7 +271,28 @@ def export_sequence(model_dir: str, npz_path: str, output_dir: str,
             # by editing this line or adding a command‑line argument.
             cam_pos = torch.zeros(3, dtype=torch.float32, device=device)
         # Export current frame
-        gaussians.export_gaussians_to_ply(fpath, cam_pos=cam_pos)
+        if cam_pos is not None:
+            gaussians.export_gaussians_to_ply(fpath, cam_pos=cam_pos)
+        else:
+            # Determine modes based on format and user override
+            std = (ply_format == 'standard')
+            eff_scale_mode = ('log' if std else 'linear') if scale_mode == 'auto' else scale_mode
+            eff_opacity_mode = ('logit' if std else 'alpha') if opacity_mode == 'auto' else opacity_mode
+
+            kwargs = dict()
+            if std:
+                kwargs.update(dict(scale_mode=eff_scale_mode,
+                                   scale_factor=scale_factor,
+                                   scale_min=scale_min,
+                                   scale_max=scale_max,
+                                   opacity_mode=eff_opacity_mode))
+            else:
+                # compat/simple use linear scale controls
+                kwargs.update(dict(scale_factor=scale_factor,
+                                   scale_min=scale_min if scale_min is not None else (1e-6 if ply_format=='compat' else None),
+                                   scale_max=scale_max if scale_max is not None else (5e-3 if ply_format=='compat' else None)))
+
+            gaussians.export_gaussians_to_ply(fpath, cam_pos=None, format_type=ply_format, color_mode=color_mode, **kwargs)
         print(f"Saved PLY for frame {idx} to {fpath}")
 
 
@@ -227,10 +305,28 @@ def main() -> None:
     parser.add_argument('--output_dir', type=str, required=True,
                         help='Output directory for PLY files')
     parser.add_argument('--view_dependent', action='store_true',
-                        help='Use view‑dependent colours (default: False)')
+                        help='Use view‑dependent colours (forces simple PLY)')
+    parser.add_argument('--format', dest='ply_format', choices=['standard','simple','compat'], default='standard',
+                        help='PLY format: standard GS or simple point cloud')
+    parser.add_argument('--color_mode', choices=['sh','position','opacity','uniform'], default='sh',
+                        help='Color mode for simple PLY')
+    parser.add_argument('--scale_mode', choices=['auto','log','linear'], default='auto',
+                        help='Scale encoding for PLY scale_* fields')
+    parser.add_argument('--scale_factor', type=float, default=1.0, help='Multiply linear scales by this factor')
+    parser.add_argument('--scale_min', type=float, default=None, help='Clamp linear scale min (None to disable)')
+    parser.add_argument('--scale_max', type=float, default=None, help='Clamp linear scale max (None to disable)')
+    parser.add_argument('--opacity_mode', choices=['auto','logit','alpha'], default='auto',
+                        help='Opacity encoding for PLY opacity field')
     args = parser.parse_args()
     export_sequence(args.model_dir, args.npz_path, args.output_dir,
-                    view_dependent=args.view_dependent)
+                    view_dependent=args.view_dependent,
+                    ply_format=args.ply_format,
+                    color_mode=args.color_mode,
+                    scale_mode=args.scale_mode,
+                    scale_factor=args.scale_factor,
+                    scale_min=args.scale_min,
+                    scale_max=args.scale_max,
+                    opacity_mode=args.opacity_mode)
 
 
 if __name__ == '__main__':

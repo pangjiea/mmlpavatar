@@ -10,6 +10,7 @@ from torch.optim import Adam, AdamW
 from torch.optim.lr_scheduler import ExponentialLR
 from pytorch3d.ops import knn_points
 from gsplat import rasterization, quat_scale_to_covar_preci, spherical_harmonics
+from pytorch3d.transforms import quaternion_to_matrix, matrix_to_quaternion
 
 def axis_angle_to_matrix(axis_angle: torch.Tensor) -> torch.Tensor:
     """
@@ -1014,25 +1015,37 @@ class GaussianModel:
     def _save_standard_ply_to_path(self, output_path):#？？
         """保存标准Gaussian Splatting格式的PLY文件到指定路径"""
         from plyfile import PlyData, PlyElement
+        # 使用与渲染一致的属性编码导出：
+        # - 位置: 全局坐标 self.get_xyz
+        # - 颜色: SH 系数 (DC + REST)
+        # - 不透明度: 逆激活 logit(alpha)
+        # - 尺度: 逆激活 log(scale)
+        # - 旋转: 与LBS/全局旋转合成后的四元数，WXYZ 顺序
 
+        # 位置
         xyz = self.get_xyz.detach().cpu().numpy()
         normals = np.zeros_like(xyz)
 
-        # 获取球谐函数特征
+        # SH 系数
         sh = self.get_sh.detach().cpu().numpy()
-        f_dc = sh[:, :1, :].transpose(0, 2, 1).reshape(-1, 3)  # [N, 3] DC分量
+        f_dc = sh[:, :1, :].transpose(0, 2, 1).reshape(-1, 3)
         if sh.shape[1] > 1:
-            f_rest = sh[:, 1:, :].transpose(0, 2, 1).reshape(-1, (sh.shape[1]-1)*3)  # [N, rest*3]
+            f_rest = sh[:, 1:, :].transpose(0, 2, 1).reshape(-1, (sh.shape[1]-1)*3)
         else:
-            f_rest = np.zeros((xyz.shape[0], 0))
+            f_rest = np.zeros((xyz.shape[0], 0), dtype=np.float32)
 
-        # 获取并处理Gaussian属性
-        opacities = self.get_opacity.detach().cpu().numpy()
-        scale = self.get_cano_scaling.detach().cpu().numpy()
-        rotation = self.get_cano_rotation.detach().cpu().numpy()
+        # 不透明度（logit）与尺度（log）
+        opacities_logit = self.inverse_opacity_activation(self.get_opacity).detach().cpu().numpy().reshape(-1, 1)
+        scales_log = self.scaling_inverse_activation(self.get_cano_scaling).detach().cpu().numpy()
 
-        # 修复Gaussian Splatting属性
-        opacities, scale, rotation = self._fix_gaussian_attributes(opacities, scale, rotation)
+        # 合成旋转：Gweights (LBS) 与 canonical rotation，再乘全局 Rh（若有）
+        rots = self.get_Gweights[:, :3, :3].contiguous()
+        if self.Rh is not None:
+            rots = self.Rh @ rots
+        # PyTorch3D 的 quaternion_to_matrix / matrix_to_quaternion 使用 WXYZ (real-first)
+        cano_R = quaternion_to_matrix(self.get_cano_rotation)
+        R_total = torch.einsum('nij,njk->nik', rots, cano_R)
+        rot_wxyz = matrix_to_quaternion(R_total).detach().cpu().numpy()
 
         # 构建属性列表
         attributes = ['x', 'y', 'z', 'nx', 'ny', 'nz']
@@ -1049,12 +1062,114 @@ class GaussianModel:
         # 组合所有属性
         if f_rest.shape[1] > 0:
             attributes_array = np.concatenate((xyz, normals, f_dc, f_rest,
-                                             opacities.reshape(-1, 1), scale, rotation), axis=1)
+                                               opacities_logit, scales_log, rot_wxyz), axis=1)
         else:
             attributes_array = np.concatenate((xyz, normals, f_dc,
-                                             opacities.reshape(-1, 1), scale, rotation), axis=1)
+                                               opacities_logit, scales_log, rot_wxyz), axis=1)
 
         elements[:] = list(map(tuple, attributes_array))
+        el = PlyElement.describe(elements, 'vertex')
+        PlyData([el]).write(output_path)
+
+    def export_gaussians_to_ply(self, output_path: str,
+                                cam_pos: torch.Tensor | None = None,
+                                format_type: str = 'standard',
+                                color_mode: str = 'sh',
+                                scale_mode: str = 'log',
+                                scale_factor: float = 1.0,
+                                scale_min: float | None = None,
+                                scale_max: float | None = None,
+                                opacity_mode: str = 'logit') -> None:
+        """将当前帧导出为PLY。
+
+        Args:
+            output_path: 输出路径
+            cam_pos: 若非空，则以视角相关颜色导出简单PLY
+            format_type: 'standard' | 'simple' | 'compat'
+            color_mode: simple模式颜色: 'sh'|'position'|'opacity'|'uniform'
+            scale_mode: 'log'|'linear' (standard/compat 有效)
+            scale_factor: 线性缩放乘子（在取log前应用）
+            scale_min/scale_max: 线性缩放裁剪（在取log前应用）
+            opacity_mode: 'logit'|'alpha' (standard/compat 有效)
+        """
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+        # 如果给了cam_pos，按视角颜色导出 simple PLY
+        if cam_pos is not None:
+            from utils.general_utils import storePly
+            colors = self.get_color(cam_pos).detach().cpu().numpy()
+            # get_color 返回 [N,3] 线性空间 [0,1]
+            colors_u8 = np.clip(colors * 255.0, 0, 255).astype(np.uint8)
+            xyz = self.get_xyz.detach().cpu().numpy()
+            storePly(output_path, xyz, colors_u8)
+            return
+
+        if format_type == 'simple':
+            return self._save_simple_ply_to_path(output_path, color_mode)
+
+        # 标准 / 兼容 格式
+        # 位置
+        xyz = self.get_xyz.detach().cpu().numpy()
+        normals = np.zeros_like(xyz)
+
+        # SH
+        sh = self.get_sh.detach().cpu().numpy()
+        f_dc = sh[:, :1, :].transpose(0, 2, 1).reshape(-1, 3)
+        if sh.shape[1] > 1:
+            f_rest_full = sh[:, 1:, :].transpose(0, 2, 1).reshape(-1, (sh.shape[1]-1)*3)
+        else:
+            f_rest_full = np.zeros((xyz.shape[0], 0), dtype=np.float32)
+        # pad/trim to 45 for degree 3 兼容
+        if format_type in ('standard', 'compat'):
+            target_rest = 45
+            rest = f_rest_full
+            if rest.shape[1] < target_rest:
+                pad = np.zeros((rest.shape[0], target_rest - rest.shape[1]), dtype=rest.dtype)
+                f_rest = np.concatenate([rest, pad], axis=1)
+            else:
+                f_rest = rest[:, :target_rest]
+        else:
+            f_rest = f_rest_full
+
+        # 不透明度
+        if opacity_mode == 'logit':
+            opacity = self.inverse_opacity_activation(self.get_opacity).detach().cpu().numpy().reshape(-1, 1)
+        else:  # 'alpha'
+            opacity = self.get_opacity.detach().cpu().numpy().reshape(-1, 1)
+
+        # 尺度（线性→可选裁剪→乘因子→编码）
+        scales_lin = self.get_cano_scaling.detach().cpu().numpy()
+        if scale_min is not None or scale_max is not None:
+            lo = -np.inf if scale_min is None else scale_min
+            hi = np.inf if scale_max is None else scale_max
+            scales_lin = np.clip(scales_lin, lo, hi)
+        if scale_factor != 1.0:
+            scales_lin = scales_lin * float(scale_factor)
+        scales_enc = np.log(scales_lin) if scale_mode == 'log' else scales_lin
+
+        # 旋转：与LBS/全球旋转合成，输出WXYZ
+        rots = self.get_Gweights[:, :3, :3].contiguous()
+        if self.Rh is not None:
+            rots = self.Rh @ rots
+        cano_R = quaternion_to_matrix(self.get_cano_rotation)
+        R_total = torch.einsum('nij,njk->nik', rots, cano_R)
+        rot_wxyz = matrix_to_quaternion(R_total).detach().cpu().numpy()
+
+        # 写PLY
+        from plyfile import PlyData, PlyElement
+        attributes = ['x', 'y', 'z', 'nx', 'ny', 'nz', 'f_dc_0', 'f_dc_1', 'f_dc_2']
+        for i in range(f_rest.shape[1]):
+            attributes.append(f'f_rest_{i}')
+        attributes.append('opacity')
+        attributes.extend(['scale_0', 'scale_1', 'scale_2'])
+        attributes.extend(['rot_0', 'rot_1', 'rot_2', 'rot_3'])
+        dtype_full = [(a, 'f4') for a in attributes]
+        elements = np.empty(xyz.shape[0], dtype=dtype_full)
+        if f_rest.shape[1] > 0:
+            arr = np.concatenate((xyz, normals, f_dc, f_rest, opacity, scales_enc, rot_wxyz), axis=1)
+        else:
+            arr = np.concatenate((xyz, normals, f_dc, opacity, scales_enc, rot_wxyz), axis=1)
+        elements[:] = list(map(tuple, arr))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(output_path)
 
