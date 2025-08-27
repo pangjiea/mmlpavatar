@@ -14,6 +14,9 @@ from argparse import ArgumentParser
 import copy
 from scipy.spatial.transform import Rotation
 import imageio.v3 as iio
+import subprocess
+from shutil import which
+from glob import glob
 from torch.utils.data import DataLoader
 
 from scene.dataset import get_dataset_type, data_to_cam
@@ -334,6 +337,56 @@ def testing_dataset(gaussians: GaussianModel, out_dir, dataset, background):
     print(msg)
 
 
+def _ensure_dir(d: str):
+    os.makedirs(d, exist_ok=True)
+
+
+def _make_safe_video_name(from_dir: str, suffix: str = "") -> str:
+    base = path.basename(path.normpath(from_dir)) or "output"
+    if suffix:
+        base = f"{base}-{suffix}"
+    return f"{base}.mp4"
+
+
+def _export_lossless_video(images_dir: str, video_out: str, fps: int = 30) -> bool:
+    """Export a 30fps MP4 using ffmpeg (x264 near-lossless).
+
+    Uses libx264 with -crf 0 and yuv444p for maximum fidelity inside MP4.
+    Note: strict mathematical losslessness in MP4 is uncommon due to RGB->YUV.
+    Returns True on success, False otherwise.
+    """
+    # Collect PNG frames
+    frames = sorted(glob(path.join(images_dir, "*.png")))
+    if len(frames) == 0:
+        print(f"[video] no frames found under {images_dir}, skip.")
+        return False
+
+    # Require ffmpeg binary
+    if which("ffmpeg") is None:
+        print("[video] ffmpeg not found in PATH, skip video export.")
+        return False
+
+    # Use glob pattern to include non-consecutive indices, rely on zero-pad sort
+    pattern = path.join(images_dir, "*.png")
+    cmd = [
+        "ffmpeg", "-y",
+        "-framerate", str(fps),
+        "-pattern_type", "glob", "-i", pattern,
+        "-c:v", "libx264",
+        "-preset", "veryslow",
+        "-crf", "0",
+        "-pix_fmt", "yuv444p",
+        video_out,
+    ]
+    try:
+        print(f"[video] exporting {video_out} from {images_dir} @ {fps} fps (x264 CRF 0)")
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"[video] ffmpeg failed: {e}")
+        return False
+
+
 @torch.no_grad()
 def testing(args: Config):
     init_smpl_pose()
@@ -367,6 +420,12 @@ def testing(args: Config):
             testing_novel_cam_pose_speed(gaussians, args.out_dir, test_frame_ids, pose_list, cam, background)
         else:
             testing_novel_cam_pose(gaussians, args.out_dir, test_frame_ids, pose_list, cam, background)
+        # Export video for novel cam path frames
+        render_root = path.join(os.getcwd(), "render")
+        _ensure_dir(render_root)
+        video_name = _make_safe_video_name(args.out_dir)
+        video_path = path.join(render_root, video_name)
+        _export_lossless_video(args.out_dir, video_path, fps=30)
     else:
         DatasetType = get_dataset_type(args.data_dir)
         testset = DatasetType(
@@ -378,6 +437,13 @@ def testing(args: Config):
         )
 
         testing_dataset(gaussians, args.out_dir, testset, background)
+        # Export video for dataset results (use the 'result' subfolder)
+        render_root = path.join(os.getcwd(), "render")
+        _ensure_dir(render_root)
+        result_dir = path.join(args.out_dir, "result")
+        video_name = _make_safe_video_name(result_dir, suffix="result")
+        video_path = path.join(render_root, video_name)
+        _export_lossless_video(result_dir, video_path, fps=30)
 
 if __name__ == "__main__":
     parser = ArgumentParser(description="Testing")
