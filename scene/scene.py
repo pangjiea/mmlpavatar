@@ -57,8 +57,9 @@ class Scene:
             dataset=trainset,
             batch_size=1,
             shuffle=True,
-            num_workers=8,
-            persistent_workers=False,
+            num_workers=getattr(args, 'num_workers', 8),
+            persistent_workers=getattr(args, 'persistent_workers', True),
+            prefetch_factor=getattr(args, 'prefetch_factor', 4),
             pin_memory=True,
         )
 

@@ -506,29 +506,41 @@ class GaussianModel:
 
         self.init()
 
+    def _make_adam(self, params, lr, betas, eps, weight_decay=0.0):
+        try:
+            return Adam(params, lr=lr, betas=betas, eps=eps, weight_decay=weight_decay, fused=True)
+        except TypeError:
+            return Adam(params, lr, betas, eps)
+
+    def _make_adamw(self, params, lr, betas, eps, weight_decay):
+        try:
+            return AdamW(params, lr=lr, betas=betas, eps=eps, weight_decay=weight_decay, fused=True)
+        except TypeError:
+            return AdamW(params, lr, betas, eps, weight_decay)
+
     def training_setup(self, args: Config, scene_scale):
         eps=1e-15 
         betas = (1 - 1 * (1 - 0.9), 1 - 1 * (1 - 0.999))
         decay = 0.001
 
         optimizers = {
-            'dxyz': Adam([self.dxyz_vt], args.position_lr * scene_scale, betas, eps),
-            'scales': Adam([self._scaling], args.scaling_lr, betas, eps),
-            'quats': Adam([self._rotation], args.rotation_lr, betas, eps),
-            'opacities': Adam([self._opacity], args.opacity_lr, betas, eps),
-            'sh0': Adam([self._sh0], args.color_lr, betas, eps),
-            'shN': Adam([self._shN], args.color_lr / 20, betas, eps),
+            'dxyz': self._make_adam([self.dxyz_vt], args.position_lr * scene_scale, betas, eps),
+            'scales': self._make_adam([self._scaling], args.scaling_lr, betas, eps),
+            'quats': self._make_adam([self._rotation], args.rotation_lr, betas, eps),
+            'opacities': self._make_adam([self._opacity], args.opacity_lr, betas, eps),
+            'sh0': self._make_adam([self._sh0], args.color_lr, betas, eps),
+            'shN': self._make_adam([self._shN], args.color_lr / 20, betas, eps),
 
-            'dxyz_bs': Adam([self.dxyz_bs], args.position_lr * scene_scale / 10, betas, eps),
-            'dscales_bs': Adam([self.scaling_bs], args.scaling_lr / 5, betas, eps),
-            'dquats_bs': Adam([self.rotation_bs], args.rotation_lr / 5, betas, eps),
-            'dopacities_bs': Adam([self.opacity_bs], args.opacity_lr / 5, betas, eps),
-            'dsh0_bs': Adam([self.sh0_bs], args.color_lr / 5, betas, eps),
-            'dshN_bs': Adam([self.shN_bs], args.color_lr / 200, betas, eps),
+            'dxyz_bs': self._make_adam([self.dxyz_bs], args.position_lr * scene_scale / 10, betas, eps),
+            'dscales_bs': self._make_adam([self.scaling_bs], args.scaling_lr / 5, betas, eps),
+            'dquats_bs': self._make_adam([self.rotation_bs], args.rotation_lr / 5, betas, eps),
+            'dopacities_bs': self._make_adam([self.opacity_bs], args.opacity_lr / 5, betas, eps),
+            'dsh0_bs': self._make_adam([self.sh0_bs], args.color_lr / 5, betas, eps),
+            'dshN_bs': self._make_adam([self.shN_bs], args.color_lr / 200, betas, eps),
 
-            'encoder_feat_params': AdamW(self.encoder_feat_params.values(), args.encoder_lr, betas, eps, decay),
+            'encoder_feat_params': self._make_adamw(self.encoder_feat_params.values(), args.encoder_lr, betas, eps, decay),
 
-            'xyz_offset': Adam([self.xyz_offset], args.xyz_offset_lr, betas, eps),
+            'xyz_offset': self._make_adam([self.xyz_offset], args.xyz_offset_lr, betas, eps),
         }
 
         schedulers = [
@@ -548,10 +560,16 @@ class GaussianModel:
         self.optimizers = optimizers
         self.schedulers = schedulers
 
-    def optimizer_step(self):
-        for optimizer in self.optimizers.values():
-            optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
+    def optimizer_step(self, scaler=None):
+        if scaler is not None and getattr(scaler, 'is_enabled', lambda: False)():
+            for optimizer in self.optimizers.values():
+                scaler.step(optimizer)
+                optimizer.zero_grad(set_to_none=True)
+            scaler.update()
+        else:
+            for optimizer in self.optimizers.values():
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
         for scheduler in self.schedulers:
             scheduler.step()
         
@@ -563,22 +581,40 @@ class GaussianModel:
         if override_color is None:
             cam_pos = torch.linalg.inv_ex(cam['w2c'])[0][:3,3]
             override_color = self.get_color(cam_pos)
-        
-        image, alpha, info = rasterization(
-            means=self.get_xyz,
-            quats=None,
-            scales=None,
-            opacities=self.get_opacity,
-            colors=override_color,
-            viewmats=cam['w2c'][None],  # [1, 4, 4]
-            Ks=cam['K'][None],  # [1, 3, 3]
-            width=cam['width'],
-            height=cam['height'],
-            packed=False,
-            near_plane=0.1,
-            backgrounds=background[None],  # [1, 3]
-            covars=covars,
-        )
+
+        # gsplat CUDA kernels expect float32; under AMP(BF16/FP16) inputs may be lower precision
+        means = self.get_xyz
+        opacities = self.get_opacity
+        colors = override_color
+        viewmats = cam['w2c'][None]  # [1, 4, 4]
+        Ks = cam['K'][None]  # [1, 3, 3]
+        bgs = background[None]  # [1, 3]
+        if torch.is_autocast_enabled():
+            means = means.float()
+            opacities = opacities.float()
+            colors = colors.float()
+            viewmats = viewmats.float()
+            Ks = Ks.float()
+            bgs = bgs.float()
+            covars = covars.float()
+
+        # Disable autocast for the kernel call to ensure expected dtype
+        with torch.autocast(device_type='cuda', enabled=False):
+            image, alpha, info = rasterization(
+                means=means,
+                quats=None,
+                scales=None,
+                opacities=opacities,
+                colors=colors,
+                viewmats=viewmats,
+                Ks=Ks,
+                width=cam['width'],
+                height=cam['height'],
+                packed=False,
+                near_plane=0.1,
+                backgrounds=bgs,
+                covars=covars,
+            )
         return image[0], alpha[0], info
 
     def init_body(self):

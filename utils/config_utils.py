@@ -33,6 +33,10 @@ class Config:
     frame_interval = 1
     image_scaling = 1
     data_in_memory = False
+    # dataloader perf
+    num_workers = 8
+    prefetch_factor = 4
+    persistent_workers = True
 
     test: ConfigTest
 
@@ -65,3 +69,7 @@ class Config:
     # iteration to start optimize the basis
     iteration_dxyz_basis = 2000
     iteration_gsparam_basis = 2000
+
+    # precision / acceleration
+    enable_amp = True
+    amp_dtype = 'bf16'  # options: 'bf16', 'fp16', 'fp32'

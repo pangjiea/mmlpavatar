@@ -29,6 +29,7 @@ from scene.net_vis import Visualizer
 from utils.config_utils import Config
 from utils.general_utils import safe_state
 from utils.loss_utils import l1_loss, psnr, lpips_loss, dxyz_smooth_loss, gaussian_scaling_loss
+import contextlib
 from utils.image_utils import crop_image
 
 def training(args: Config):
@@ -43,6 +44,19 @@ def training(args: Config):
     visualizer.load_cams_poses(args.out_dir)
 
     background = torch.as_tensor(args.background).float().cuda()
+
+    # AMP setup for A100 acceleration
+    use_amp = getattr(args, 'enable_amp', True)
+    amp_dtype_str = getattr(args, 'amp_dtype', 'bf16')
+    if amp_dtype_str.lower() in ['bf16', 'bfloat16']:
+        amp_dtype = torch.bfloat16
+        scaler = torch.cuda.amp.GradScaler(enabled=False)
+    elif amp_dtype_str.lower() in ['fp16', 'float16', 'half']:
+        amp_dtype = torch.float16
+        scaler = torch.cuda.amp.GradScaler(enabled=True)
+    else:
+        amp_dtype = None
+        scaler = torch.cuda.amp.GradScaler(enabled=False)
 
     ema_vis_loss, ema_lpips_loss = 0.0, 0.0
     first_iter = 0
@@ -67,26 +81,31 @@ def training(args: Config):
         gaussians.smpl_poses = cam['pose']
         gaussians.Th, gaussians.Rh = cam['Th'], cam['Rh']
 
-        image, alpha, info = gaussians.render(cam, background=bg)
-        image = torch.clamp(image, 0, 1)
-        image_gt, mask, mask_boundary = cam['image'], cam['mask'], cam['mask_boundary']
-        image_gt[~mask] = bg
-        image_gt[mask_boundary] = bg
-        image[mask_boundary] = bg
+        autocast_ctx = torch.autocast(device_type='cuda', dtype=amp_dtype) if (use_amp and amp_dtype is not None) else contextlib.nullcontext()
+        with autocast_ctx:
+            image, alpha, info = gaussians.render(cam, background=bg)
+            image = torch.clamp(image, 0, 1)
+            image_gt, mask, mask_boundary = cam['image'], cam['mask'], cam['mask_boundary']
+            image_gt[~mask] = bg
+            image_gt[mask_boundary] = bg
+            image[mask_boundary] = bg
 
-        l1loss = l1_loss(image, image_gt)
-        dxyzsmoothloss = dxyz_smooth_loss(gaussians) * args.lambda_dxyz_smooth
+            l1loss = l1_loss(image, image_gt)
+            dxyzsmoothloss = dxyz_smooth_loss(gaussians) * args.lambda_dxyz_smooth
 
-        random_patch_flag = False if iteration < args.iteration_lpips_random_patch else True
-        image_crop, image_gt_crop = crop_image(bg, mask, 512, random_patch_flag, image.permute(2,0,1), image_gt.permute(2,0,1))
-        if iteration > args.iteration_lpips: lpipsloss = lpips_loss(image_crop.permute(1,2,0), image_gt_crop.permute(1,2,0)) * args.lambda_lpips
-        else: lpipsloss = torch.tensor(0) 
+            random_patch_flag = False if iteration < args.iteration_lpips_random_patch else True
+            image_crop, image_gt_crop = crop_image(bg, mask, 512, random_patch_flag, image.permute(2,0,1), image_gt.permute(2,0,1))
+            if iteration > args.iteration_lpips: lpipsloss = lpips_loss(image_crop.permute(1,2,0), image_gt_crop.permute(1,2,0)) * args.lambda_lpips
+            else: lpipsloss = torch.tensor(0) 
 
-        scaling_loss = args.lambda_scaling * gaussian_scaling_loss(gaussians.get_cano_scaling, args.scaling_threshold)
+            scaling_loss = args.lambda_scaling * gaussian_scaling_loss(gaussians.get_cano_scaling, args.scaling_threshold)
 
-        loss = l1loss + lpipsloss + dxyzsmoothloss + scaling_loss
+            loss = l1loss + lpipsloss + dxyzsmoothloss + scaling_loss
 
-        loss.backward()
+        if scaler.is_enabled():
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
 
         # log part
         ema_vis_loss = 0.4 * l1loss.item() + 0.6 * ema_vis_loss
@@ -104,7 +123,7 @@ def training(args: Config):
         training_report(scene, gaussians, iteration, args.test_iterations, loss_dict, background)
 
         # optimizer step
-        gaussians.optimizer_step()
+        gaussians.optimizer_step(scaler if scaler.is_enabled() else None)
 
         if iteration == args.iteration_dxyz_basis:
             gaussians.is_dxyz_bs = True
@@ -206,5 +225,11 @@ if __name__ == "__main__":
     safe_state(False, args.seed)
 
     torch.backends.cuda.matmul.allow_tf32 = True
+    # cuDNN autotuner for convs (LPIPS), matmul TF32 precision preference
+    torch.backends.cudnn.benchmark = True
+    try:
+        torch.set_float32_matmul_precision('high')
+    except Exception:
+        pass
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     training(args)
