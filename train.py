@@ -45,18 +45,6 @@ def training(args: Config):
 
     background = torch.as_tensor(args.background).float().cuda()
 
-    # AMP setup for A100 acceleration
-    use_amp = getattr(args, 'enable_amp', True)
-    amp_dtype_str = getattr(args, 'amp_dtype', 'bf16')
-    if amp_dtype_str.lower() in ['bf16', 'bfloat16']:
-        amp_dtype = torch.bfloat16
-        scaler = torch.cuda.amp.GradScaler(enabled=False)
-    elif amp_dtype_str.lower() in ['fp16', 'float16', 'half']:
-        amp_dtype = torch.float16
-        scaler = torch.cuda.amp.GradScaler(enabled=True)
-    else:
-        amp_dtype = None
-        scaler = torch.cuda.amp.GradScaler(enabled=False)
 
     ema_vis_loss, ema_lpips_loss = 0.0, 0.0
     first_iter = 0
