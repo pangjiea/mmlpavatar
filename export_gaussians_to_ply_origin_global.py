@@ -45,7 +45,6 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from scene.gaussian_model import GaussianModel  # type: ignore
-from utils.smpl_utils import init_smpl_pose, smpl  # ensure smpl.smpl_bigpose is available
 
 
 def _write_ply_points(path: str, xyz: np.ndarray, rgb: np.ndarray | None = None) -> None:
@@ -127,119 +126,7 @@ def _fallback_export_simple(gaussians: GaussianModel, out_path: str, color_mode:
         rgb = None
 
     _write_ply_points(out_path, xyz, rgb)
-
-
-def _quat_to_mat(q: torch.Tensor) -> torch.Tensor:
-    """Quaternion (w,x,y,z) -> rotation matrix [N,3,3]."""
-    q = torch.nn.functional.normalize(q, dim=-1)
-    w, x, y, z = q.unbind(-1)
-    ww, xx, yy, zz = w*w, x*x, y*y, z*z
-    wx, wy, wz = w*x, w*y, w*z
-    xy, xz, yz = x*y, x*z, y*z
-    m00 = 1 - 2*(yy + zz)
-    m01 = 2*(xy - wz)
-    m02 = 2*(xz + wy)
-    m10 = 2*(xy + wz)
-    m11 = 1 - 2*(xx + zz)
-    m12 = 2*(yz - wx)
-    m20 = 2*(xz - wy)
-    m21 = 2*(yz + wx)
-    m22 = 1 - 2*(xx + yy)
-    return torch.stack([
-        torch.stack([m00, m01, m02], dim=-1),
-        torch.stack([m10, m11, m12], dim=-1),
-        torch.stack([m20, m21, m22], dim=-1),
-    ], dim=-2)
-
-
-def _mat_to_quat_xyzw(R: torch.Tensor) -> torch.Tensor:
-    """Rotation matrix [N,3,3] -> quaternion (x,y,z,w) [N,4]."""
-    N = R.shape[0]
-    q = torch.empty((N, 4), dtype=R.dtype, device=R.device)
-    tr = R[:, 0, 0] + R[:, 1, 1] + R[:, 2, 2]
-    mask1 = tr > 0
-    S = torch.sqrt(tr[mask1] + 1.0) * 2.0
-    qw = 0.25 * S
-    qx = (R[mask1, 2, 1] - R[mask1, 1, 2]) / S
-    qy = (R[mask1, 0, 2] - R[mask1, 2, 0]) / S
-    qz = (R[mask1, 1, 0] - R[mask1, 0, 1]) / S
-    q[mask1] = torch.stack([qx, qy, qz, qw], dim=-1)
-    mask2 = (~mask1) & (R[:, 0, 0] > R[:, 1, 1]) & (R[:, 0, 0] > R[:, 2, 2])
-    S = torch.sqrt(1.0 + R[mask2, 0, 0] - R[mask2, 1, 1] - R[mask2, 2, 2]) * 2.0
-    qw = (R[mask2, 2, 1] - R[mask2, 1, 2]) / S
-    qx = 0.25 * S
-    qy = (R[mask2, 0, 1] + R[mask2, 1, 0]) / S
-    qz = (R[mask2, 0, 2] + R[mask2, 2, 0]) / S
-    q[mask2] = torch.stack([qx, qy, qz, qw], dim=-1)
-    mask3 = (~mask1) & (~mask2) & (R[:, 1, 1] > R[:, 2, 2])
-    S = torch.sqrt(1.0 + R[mask3, 1, 1] - R[mask3, 0, 0] - R[mask3, 2, 2]) * 2.0
-    qw = (R[mask3, 0, 2] - R[mask3, 2, 0]) / S
-    qx = (R[mask3, 0, 1] + R[mask3, 1, 0]) / S
-    qy = 0.25 * S
-    qz = (R[mask3, 1, 2] + R[mask3, 2, 1]) / S
-    q[mask3] = torch.stack([qx, qy, qz, qw], dim=-1)
-    mask4 = (~mask1) & (~mask2) & (~mask3)
-    S = torch.sqrt(1.0 + R[mask4, 2, 2] - R[mask4, 0, 0] - R[mask4, 1, 1]) * 2.0
-    qw = (R[mask4, 1, 0] - R[mask4, 0, 1]) / S
-    qx = (R[mask4, 0, 2] + R[mask4, 2, 0]) / S
-    qy = (R[mask4, 1, 2] + R[mask4, 2, 1]) / S
-    qz = 0.25 * S
-    q[mask4] = torch.stack([qx, qy, qz, qw], dim=-1)
-    return torch.nn.functional.normalize(q, dim=-1)
-
-
-def _write_ply_gs_standard(path: str,
-                           xyz: np.ndarray,
-                           scales_log: np.ndarray,
-                           quats_xyzw: np.ndarray,
-                           opacity_logit: np.ndarray,
-                           sh: np.ndarray) -> None:
-    """Write standard GS PLY (ASCII) with SH, log scales, XYZW quats, logit opacity."""
-    N = xyz.shape[0]
-    C = sh.shape[1]
-    f_dc = sh[:, 0, :]
-    f_rest = sh[:, 1:, :].reshape(N, (C - 1) * 3) if C > 1 else np.zeros((N, 0), dtype=np.float32)
-    header = [
-        "ply",
-        "format ascii 1.0",
-        f"element vertex {N}",
-        "property float x",
-        "property float y",
-        "property float z",
-        "property float nx",
-        "property float ny",
-        "property float nz",
-        "property float f_dc_0",
-        "property float f_dc_1",
-        "property float f_dc_2",
-    ]
-    for i in range(f_rest.shape[1]):
-        header.append(f"property float f_rest_{i}")
-    header += [
-        "property float opacity",
-        "property float scale_0",
-        "property float scale_1",
-        "property float scale_2",
-        "property float rot_0",
-        "property float rot_1",
-        "property float rot_2",
-        "property float rot_3",
-        "end_header",
-    ]
-    with open(path, "w") as f:
-        f.write("\n".join(header) + "\n")
-        for i in range(N):
-            x, y, z = xyz[i]
-            dc0, dc1, dc2 = f_dc[i]
-            rest = " ".join(f"{v:.6f}" for v in f_rest[i]) if f_rest.shape[1] > 0 else ""
-            op = opacity_logit[i, 0] if opacity_logit.ndim == 2 else opacity_logit[i]
-            s0, s1, s2 = scales_log[i]
-            qx, qy, qz, qw = quats_xyzw[i]
-            line = f"{x:.6f} {y:.6f} {z:.6f} 0.000000 0.000000 0.000000 {dc0:.6f} {dc1:.6f} {dc2:.6f}"
-            if rest:
-                line += " " + rest
-            line += f" {op:.6f} {s0:.6f} {s1:.6f} {s2:.6f} {qx:.6f} {qy:.6f} {qz:.6f} {qw:.6f}\n"
-            f.write(line)
+from utils.smpl_utils import init_smpl_pose  # ensure smpl.smpl_bigpose is available for restore()
 
 
 def _find_checkpoint(model_dir: str) -> str:
@@ -366,7 +253,8 @@ def export_sequence(model_dir: str, npz_path: str, output_dir: str,
                     scale_min: float | None = None,
                     scale_max: float | None = None,
                     opacity_mode: str = 'auto',
-                    only_frame: int | None = None) -> None:
+                    only_frame: int | None = None,
+                    frame_range: tuple[int, int, int] | None = None) -> None:
     """Export a sequence of PLY files from a Gaussian model.
 
     Args:
@@ -394,14 +282,6 @@ def export_sequence(model_dir: str, npz_path: str, output_dir: str,
     load_data = torch.load(ckpt_path, weights_only=False)
     # `restore` populates the model parameters; it returns self
     gaussians.restore(load_data)
-    # Recommended flags for export to match training-time pose encoder
-    gaussians.is_test = True
-    try:
-        gaussians.prepare_test()
-    except Exception:
-        pass
-    gaussians.is_gsparam_bs = True
-    gaussians.is_dxyz_bs = True
     # Ensure encoder params are float32 to avoid dtype mismatch
     if hasattr(gaussians, 'encoder_feat_params') and isinstance(gaussians.encoder_feat_params, dict):
         for k in list(gaussians.encoder_feat_params.keys()):
@@ -417,11 +297,11 @@ def export_sequence(model_dir: str, npz_path: str, output_dir: str,
     else:
         device = torch.device('cpu')
 
-    motion = _load_motion(npz_path) if npz_path else {}
+    motion = _load_motion(npz_path)
     n_frames = _get_frame_count(motion)
-    # If no motion file or empty, default to one canonical frame
     if n_frames == 0:
-        n_frames = 1
+        print("No frames found in motion file.")
+        return
 
     # Keys for rotation and translation
     Rh_key = 'Rh' if 'Rh' in motion else ('global_orient' if 'global_orient' in motion else None)
@@ -432,24 +312,32 @@ def export_sequence(model_dir: str, npz_path: str, output_dir: str,
     leye_key = 'leye_pose' if 'leye_pose' in motion else None
     reye_key = 'reye_pose' if 'reye_pose' in motion else None
 
+    # Build frame indices
+    frame_indices: list[int]
     if only_frame is not None:
-        if only_frame < 0 or only_frame >= n_frames:
-            print(f"Requested frame {only_frame} is out of range [0, {n_frames-1}] — skipping.")
-            return
         frame_indices = [only_frame]
+    elif frame_range is not None:
+        start, end, step = frame_range
+        if step == 0:
+            step = 1
+        if end < start:
+            start, end = end, start
+        frame_indices = list(range(start, end + 1, step))
     else:
         frame_indices = list(range(n_frames))
+    # Clamp to valid range
+    frame_indices = [i for i in frame_indices if 0 <= i < n_frames]
+    if not frame_indices:
+        print(f"No valid frames to export after clamping to [0, {n_frames-1}].")
+        return
 
     for idx in frame_indices:
         # Set full pose (165) to satisfy joint assertions in GaussianModel
-        if motion:
-            pose_np = _compose_full_pose(motion, idx)
-            gaussians.smpl_poses = torch.from_numpy(pose_np).float()
-        else:
-            gaussians.smpl_poses = smpl.smpl_bigpose
+        pose_np = _compose_full_pose(motion, idx)
+        gaussians.smpl_poses = torch.from_numpy(pose_np).float()
 
         # Set global rotation (Rh)
-        if Rh_key is not None and motion:
+        if Rh_key is not None:
             Rh_np = _select_frame(motion[Rh_key], idx)
             # Accept either axis-angle (3,) or rotation matrix (3x3)
             if Rh_np.shape == (3,):
@@ -473,10 +361,11 @@ def export_sequence(model_dir: str, npz_path: str, output_dir: str,
                 # Unknown format; default to identity
                 gaussians.Rh = torch.eye(3, dtype=torch.float32)
         else:
+            # Identity rotation (setter will treat identity as None)
             gaussians.Rh = torch.eye(3, dtype=torch.float32)
 
         # Set global translation (Th)
-        if Th_key is not None and motion:
+        if Th_key is not None:
             Th_np = _select_frame(motion[Th_key], idx)
             gaussians.Th = torch.from_numpy(Th_np).float()
         else:
@@ -514,7 +403,9 @@ def export_sequence(model_dir: str, npz_path: str, output_dir: str,
             gaussians.reye_pose = torch.from_numpy(reye_np).float()
 
         # Compute output filename
-        fname = f"frame_{idx:04d}.ply"
+        # Zero padding width inferred from max index
+        pad = max(4, len(str(max(frame_indices))))
+        fname = f"frame_{idx:0{pad}d}.ply"
         fpath = os.path.join(output_dir, fname)
         # Compute camera position for view‑dependent colour if requested
         cam_pos = None
@@ -522,45 +413,31 @@ def export_sequence(model_dir: str, npz_path: str, output_dir: str,
             # Use origin as a default camera position; users may customise this
             # by editing this line or adding a command‑line argument.
             cam_pos = torch.zeros(3, dtype=torch.float32, device=device)
-        # Export current frame in GS standard format (or simple fallback)
-        if ply_format in ('standard', 'compat'):
-            with torch.no_grad():
-                means = gaussians.get_xyz
-                # scales (linear then log if requested)
-                scales_lin = gaussians.get_cano_scaling * float(scale_factor)
-                if scale_min is not None:
-                    scales_lin = torch.clamp(scales_lin, min=float(scale_min))
-                if scale_max is not None:
-                    scales_lin = torch.clamp(scales_lin, max=float(scale_max))
-                if (scale_mode == 'auto' and ply_format == 'standard') or scale_mode == 'log':
-                    scales = torch.log(torch.clamp(scales_lin, min=1e-12))
+        # Export current frame (use model's method when available; else fallback to simple PLY)
+        if hasattr(gaussians, 'export_gaussians_to_ply') and callable(getattr(gaussians, 'export_gaussians_to_ply')):
+            if cam_pos is not None:
+                gaussians.export_gaussians_to_ply(fpath, cam_pos=cam_pos)
+            else:
+                # Determine modes based on format and user override
+                std = (ply_format == 'standard')
+                eff_scale_mode = ('log' if std else 'linear') if scale_mode == 'auto' else scale_mode
+                eff_opacity_mode = ('logit' if std else 'alpha') if opacity_mode == 'auto' else opacity_mode
+                kwargs = dict()
+                if std:
+                    kwargs.update(dict(scale_mode=eff_scale_mode,
+                                       scale_factor=scale_factor,
+                                       scale_min=scale_min,
+                                       scale_max=scale_max,
+                                       opacity_mode=eff_opacity_mode))
                 else:
-                    scales = scales_lin
-                # rotations: skinned rots @ cano_quat -> XYZW
-                R_pose = gaussians.get_Gweights[:, :3, :3]
-                R_quat = _quat_to_mat(gaussians.get_cano_rotation)
-                R_comb = torch.matmul(R_pose, R_quat)
-                if gaussians.Rh is not None:
-                    R_comb = torch.einsum('ij,njk->nik', gaussians.Rh, R_comb)
-                quats_xyzw = _mat_to_quat_xyzw(R_comb)
-                # opacity: logit (standard) or alpha
-                alpha = gaussians.get_opacity
-                if (opacity_mode == 'auto' and ply_format == 'standard') or opacity_mode == 'logit':
-                    eps = 1e-6
-                    op = torch.logit(torch.clamp(alpha, eps, 1 - eps))
-                else:
-                    op = alpha
-                sh = gaussians.get_sh
-            _write_ply_gs_standard(
-                fpath,
-                means.detach().cpu().numpy().astype(np.float32),
-                scales.detach().cpu().numpy().astype(np.float32),
-                quats_xyzw.detach().cpu().numpy().astype(np.float32),
-                op.detach().cpu().numpy().astype(np.float32),
-                sh.detach().cpu().numpy().astype(np.float32),
-            )
+                    # compat/simple use linear scale controls
+                    kwargs.update(dict(scale_factor=scale_factor,
+                                       scale_min=scale_min if scale_min is not None else (1e-6 if ply_format=='compat' else None),
+                                       scale_max=scale_max if scale_max is not None else (5e-3 if ply_format=='compat' else None)))
+                gaussians.export_gaussians_to_ply(fpath, cam_pos=None, format_type=ply_format, color_mode=color_mode, **kwargs)
         else:
             if cam_pos is None and view_dependent:
+                # ensure cam_pos for SH coloring if requested
                 cam_pos = torch.zeros(3, dtype=torch.float32, device=device)
             _fallback_export_simple(gaussians, fpath, color_mode=('sh' if color_mode else 'uniform'), cam_pos=cam_pos)
         print(f"Saved PLY for frame {idx} to {fpath}")
@@ -570,8 +447,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Export Gaussian points to PLY sequence")
     parser.add_argument('--model_dir', type=str, required=True,
                         help='Directory containing trained model checkpoints')
-    parser.add_argument('--npz_path', type=str, default='',
-                        help='Path to motion parameters (.npz). If empty, export canonical bigpose')
+    parser.add_argument('--npz_path', type=str, required=True,
+                        help='Path to motion parameters (.npz)')
     parser.add_argument('--output_dir', type=str, required=True,
                         help='Output directory for PLY files')
     parser.add_argument('--view_dependent', action='store_true',
@@ -588,7 +465,23 @@ def main() -> None:
     parser.add_argument('--opacity_mode', choices=['auto','logit','alpha'], default='auto',
                         help='Opacity encoding for PLY opacity field')
     parser.add_argument('--frame', type=int, default=None, help='Export only this frame index (0-based)')
+    parser.add_argument('--range', dest='frame_range', type=str, default=None,
+                        help="Export a range like '1700-2000' or '1700:2000' or with step '1700:2000:2'")
     args = parser.parse_args()
+    # Parse frame range
+    fr_tuple = None
+    if args.frame_range:
+        txt = args.frame_range.replace('-', ':')
+        parts = [p for p in txt.split(':') if p != '']
+        try:
+            if len(parts) == 2:
+                s, e = int(parts[0]), int(parts[1])
+                fr_tuple = (s, e, 1)
+            elif len(parts) == 3:
+                s, e, st = int(parts[0]), int(parts[1]), int(parts[2])
+                fr_tuple = (s, e, st)
+        except ValueError:
+            fr_tuple = None
     export_sequence(args.model_dir, args.npz_path, args.output_dir,
                     view_dependent=args.view_dependent,
                     ply_format=args.ply_format,
@@ -598,7 +491,8 @@ def main() -> None:
                     scale_min=args.scale_min,
                     scale_max=args.scale_max,
                     opacity_mode=args.opacity_mode,
-                    only_frame=args.frame)
+                    only_frame=args.frame,
+                    frame_range=fr_tuple)
 
 
 if __name__ == '__main__':

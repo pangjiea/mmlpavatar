@@ -25,7 +25,7 @@ import argparse
 import os
 from pathlib import Path
 import json
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 
 import numpy as np
 from PIL import Image
@@ -163,6 +163,50 @@ def chamfer_distances(pts_a: np.ndarray, pts_b: np.ndarray) -> Dict[str, float]:
     return {"chamfer_L2_cm2": float(c2), "chamfer_L1_cm": float(c1)}
 
 
+def parse_frame_range(txt: str) -> List[int]:
+    txt = txt.strip().replace('-', ':')
+    parts = [p for p in txt.split(':') if p != '']
+    if not parts:
+        return []
+    try:
+        if len(parts) == 1:
+            i = int(parts[0]); return [i]
+        elif len(parts) == 2:
+            a, b = int(parts[0]), int(parts[1])
+            if b < a:
+                a, b = b, a
+            return list(range(a, b + 1))
+        else:
+            a, b, s = int(parts[0]), int(parts[1]), int(parts[2])
+            if s == 0:
+                s = 1
+            if b < a:
+                a, b = b, a
+            return list(range(a, b + 1, s))
+    except ValueError:
+        return []
+
+
+def find_ply_b_for_frame(bdir: Path, frame: int, template: Optional[str] = None) -> Optional[Path]:
+    if template:
+        try:
+            name = template.format(frame=frame)
+            p = bdir / name
+            return p if p.is_file() else None
+        except Exception:
+            pass
+    candidates: List[Path] = []
+    candidates.append(bdir / f"{frame}.ply")
+    for z in (4, 5, 6, 8):
+        candidates.append(bdir / f"{frame:0{z}d}.ply")
+        candidates.append(bdir / f"frame_{frame:0{z}d}.ply")
+    candidates.append(bdir / f"frame_{frame}.ply")
+    for p in candidates:
+        if p.is_file():
+            return p
+    return None
+
+
 def main():
     ap = argparse.ArgumentParser(description="Evaluate IoU for masks and Chamfer for PLYs")
     ap.add_argument('--root', required=True, help='Root directory')
@@ -170,7 +214,12 @@ def main():
     ap.add_argument('--mask_render_dir', default='mask_render', help='Subdir under root for predicted masks')
     ap.add_argument('--mask_thresh', type=int, default=127, help='Threshold for binarizing grayscale masks')
     ap.add_argument('--ply_a', default=None, help='Subdir under root for PLY set A (e.g., GT)')
-    ap.add_argument('--ply_b', default=None, help='Subdir under root for PLY set B (e.g., Pred)')
+    ap.add_argument('--ply_b', default=None, help='Subdir under root or absolute path for PLY set B (e.g., Pred)')
+    # Per-frame A vs single-dir B mode
+    ap.add_argument('--ply_frames_root', default=None, help='Root where subfolders are named by frame numbers (e.g., 1701/1702/...)')
+    ap.add_argument('--ply_frames_rel', default='dense/fuse.ply', help='Relative path inside each frame folder (default: dense/fuse.ply)')
+    ap.add_argument('--ply_frames_range', default=None, help="Frame range like '1701-2000' or '1701:2000[:step]'")
+    ap.add_argument('--ply_b_template', default=None, help="Filename template for B, e.g., 'frame_{frame:05d}.ply'")
     ap.add_argument('--sample_points', type=int, default=100000, help='Num points to sample from mesh for Chamfer')
     ap.add_argument('--out', default=None, help='Output metrics JSON path (default: <root>/metrics_eval.json)')
     args = ap.parse_args()
@@ -212,40 +261,40 @@ def main():
         print(f"Skip mask IoU: missing '{mask_dir}' or '{mask_render_dir}'")
 
     # 2) Chamfer for PLYs
-    if args.ply_a and args.ply_b:
-        ply_a_dir = root / args.ply_a
-        ply_b_dir = root / args.ply_b
-    else:
-        # Try default subfolders if not provided
-        candidates = [p for p in root.iterdir() if p.is_dir() and p.name.lower() not in {args.mask_dir.lower(), args.mask_render_dir.lower()}]
-        # Pick first two that contain PLYs
-        ply_dirs = []
-        for p in candidates:
-            if any(c.suffix.lower() == '.ply' for c in p.iterdir() if c.is_file()):
-                ply_dirs.append(p)
-        if len(ply_dirs) >= 2:
-            ply_a_dir, ply_b_dir = ply_dirs[:2]
-        else:
-            ply_a_dir = ply_b_dir = None
-
-    if ply_a_dir and ply_b_dir and ply_a_dir.is_dir() and ply_b_dir.is_dir():
-        commons = find_common_files(ply_a_dir, ply_b_dir, exts=('.ply',))
+    did_chamfer = False
+    if args.ply_frames_root and args.ply_frames_range and args.ply_b:
+        frames = parse_frame_range(args.ply_frames_range)
+        a_root = Path(args.ply_frames_root)
+        b_dir = Path(args.ply_b)
+        if not a_root.is_absolute():
+            a_root = root / a_root
+        if not b_dir.is_absolute():
+            b_dir = root / b_dir
         c2_list, c1_list = [], []
-        print(f"Chamfer pairs: {len(commons)} (A: {ply_a_dir.name}, B: {ply_b_dir.name})")
-        for stem in commons:
-            pa = ply_a_dir / f"{stem}.ply"
-            pb = ply_b_dir / f"{stem}.ply"
+        print(f"Chamfer per-frame: {len(frames)} frames; A={a_root}, rel='{args.ply_frames_rel}', B={b_dir}")
+        for frame in frames:
+            pa = a_root / str(frame) / args.ply_frames_rel
+            pb = find_ply_b_for_frame(b_dir, frame, template=args.ply_b_template)
+            key = str(frame)
+            if not pa.is_file():
+                metrics.setdefault("ply_chamfer", {})[key] = {"error": f"missing {pa}"}
+                print(f"  {key}: missing A {pa}")
+                continue
+            if pb is None:
+                metrics.setdefault("ply_chamfer", {})[key] = {"error": f"missing in {b_dir}"}
+                print(f"  {key}: missing B in {b_dir}")
+                continue
             try:
                 a_pts = load_ply_points(pa, sample_points=args.sample_points)
                 b_pts = load_ply_points(pb, sample_points=args.sample_points)
                 d = chamfer_distances(a_pts, b_pts)
-                metrics["ply_chamfer"][stem] = d
+                metrics["ply_chamfer"][key] = d
                 c2_list.append(d["chamfer_L2_cm2"])
                 c1_list.append(d["chamfer_L1_cm"])
-                print(f"  {stem}: L2_cm2={d['chamfer_L2_cm2']:.4f}, L1_cm={d['chamfer_L1_cm']:.4f}")
+                print(f"  {key}: L2_cm2={d['chamfer_L2_cm2']:.4f}, L1_cm={d['chamfer_L1_cm']:.4f}")
             except Exception as e:
-                metrics["ply_chamfer"][stem] = {"error": str(e)}
-                print(f"  {stem}: error {e}")
+                metrics["ply_chamfer"][key] = {"error": str(e)}
+                print(f"  {key}: error {e}")
         if c2_list:
             c2 = np.array(c2_list, dtype=np.float32)
             c1 = np.array(c1_list, dtype=np.float32)
@@ -255,8 +304,52 @@ def main():
                 "L1_cm_mean": float(c1.mean()),
             }
             print(f"Chamfer L2_cm2 mean: {metrics['ply_chamfer_summary']['L2_cm2_mean']:.4f}")
-    else:
-        print("Skip Chamfer: PLY directories not provided or not found.")
+        did_chamfer = True
+
+    if not did_chamfer:
+        if args.ply_a and args.ply_b:
+            ply_a_dir = root / args.ply_a
+            ply_b_dir = root / args.ply_b
+        else:
+            candidates = [p for p in root.iterdir() if p.is_dir() and p.name.lower() not in {args.mask_dir.lower(), args.mask_render_dir.lower()}]
+            ply_dirs = []
+            for p in candidates:
+                if any(c.suffix.lower() == '.ply' for c in p.iterdir() if c.is_file()):
+                    ply_dirs.append(p)
+            if len(ply_dirs) >= 2:
+                ply_a_dir, ply_b_dir = ply_dirs[:2]
+            else:
+                ply_a_dir = ply_b_dir = None
+
+        if ply_a_dir and ply_b_dir and ply_a_dir.is_dir() and ply_b_dir.is_dir():
+            commons = find_common_files(ply_a_dir, ply_b_dir, exts=('.ply',))
+            c2_list, c1_list = [], []
+            print(f"Chamfer pairs: {len(commons)} (A: {ply_a_dir.name}, B: {ply_b_dir.name})")
+            for stem in commons:
+                pa = ply_a_dir / f"{stem}.ply"
+                pb = ply_b_dir / f"{stem}.ply"
+                try:
+                    a_pts = load_ply_points(pa, sample_points=args.sample_points)
+                    b_pts = load_ply_points(pb, sample_points=args.sample_points)
+                    d = chamfer_distances(a_pts, b_pts)
+                    metrics["ply_chamfer"][stem] = d
+                    c2_list.append(d["chamfer_L2_cm2"])
+                    c1_list.append(d["chamfer_L1_cm"])
+                    print(f"  {stem}: L2_cm2={d['chamfer_L2_cm2']:.4f}, L1_cm={d['chamfer_L1_cm']:.4f}")
+                except Exception as e:
+                    metrics["ply_chamfer"][stem] = {"error": str(e)}
+                    print(f"  {stem}: error {e}")
+            if c2_list:
+                c2 = np.array(c2_list, dtype=np.float32)
+                c1 = np.array(c1_list, dtype=np.float32)
+                metrics["ply_chamfer_summary"] = {
+                    "count": int(c2.size),
+                    "L2_cm2_mean": float(c2.mean()),
+                    "L1_cm_mean": float(c1.mean()),
+                }
+                print(f"Chamfer L2_cm2 mean: {metrics['ply_chamfer_summary']['L2_cm2_mean']:.4f}")
+        else:
+            print("Skip Chamfer: PLY directories not provided or not found.")
 
     out_path = Path(args.out) if args.out else (root / 'metrics_eval.json')
     ensure_dir(out_path)
@@ -267,4 +360,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

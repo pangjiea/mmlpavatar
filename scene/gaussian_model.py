@@ -284,7 +284,7 @@ class GaussianModel:
 
     @property
     def get_joint_features(self):
-
+        # Base body pose features (63 dims: 21 joints * 3)
         if self.is_test:
             sigma_pca = 2.0
             features = self.smpl_poses_cuda[1*3:22*3][None]
@@ -292,9 +292,44 @@ class GaussianModel:
             std = self.pca_std
             lowdim_pose_conds = torch.maximum(lowdim_pose_conds, -sigma_pca * std)
             lowdim_pose_conds = torch.minimum(lowdim_pose_conds, sigma_pca * std)
-            features = self.pca.inverse_transform(lowdim_pose_conds).reshape(-1)
+            body = self.pca.inverse_transform(lowdim_pose_conds).reshape(-1)
         else:
-            features = self.smpl_poses_cuda[3:3*22]
+            body = self.smpl_poses_cuda[3:3*22]
+
+        # Some checkpoints expect additional cues (jaw/eyes/expression). Detect input dim.
+        extra = []
+        try:
+            in_c = self.encoder_feat_params['layers.0.weight'].shape[-1]
+        except Exception:
+            in_c = body.numel()
+
+        # If more than 63 are expected, append available extras in the order:
+        # jaw(3), leye(3), reye(3), expression(10)
+        need = int(in_c) - int(body.numel())
+        if need > 0:
+            def _get_attr(name, dim):
+                v = getattr(self, name, None)
+                if v is None:
+                    return torch.zeros(dim, dtype=body.dtype, device=body.device)
+                v = torch.as_tensor(v, dtype=body.dtype, device=body.device).reshape(-1)
+                if v.numel() < dim:
+                    v = torch.nn.functional.pad(v, (0, dim - v.numel()))
+                return v[:dim]
+
+            pieces = []
+            rem = need
+            for name, dim in [("jaw_pose", 3), ("leye_pose", 3), ("reye_pose", 3), ("expression", 10)]:
+                if rem <= 0:
+                    break
+                d = min(dim, rem)
+                pieces.append(_get_attr(name, d))
+                rem -= d
+            if rem > 0:
+                pieces.append(torch.zeros(rem, dtype=body.dtype, device=body.device))
+            extra = torch.cat(pieces, dim=0) if pieces else torch.zeros(0, dtype=body.dtype, device=body.device)
+            features = torch.cat([body, extra], dim=0)
+        else:
+            features = body
 
         return features
 
