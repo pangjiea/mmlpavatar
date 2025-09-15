@@ -13,3 +13,6 @@ confi
 smpl_model
 remote_home_yyr
 config
+.mamba
+tmp_gt_frames
+.venv_face

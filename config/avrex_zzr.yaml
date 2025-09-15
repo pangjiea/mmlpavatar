@@ -18,8 +18,8 @@ data_in_memory: false
 
 test:
   cam_ids: [1]
-  num_frame: 500
-  begin_ith_frame: 0
+  num_frame: 200
+  begin_ith_frame: 1800
   frame_interval: 1
   image_scaling: 1
 

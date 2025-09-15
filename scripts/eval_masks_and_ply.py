@@ -8,12 +8,15 @@ Usage:
       --root <root_dir> \
       [--mask_dir mask --mask_render_dir mask_render] \
       [--ply_a ply_a --ply_b ply_b] \
+      [--ply_file_a <path/to/a.ply> --ply_file_b <path/to/b.ply>] \
+      [--ply_frames_root ... --ply_frames_range ... --ply_b <dir>] \
       [--mask_thresh 127] [--sample_points 100000] \
       [--out metrics_eval.json]
 
 Assumptions:
   - <root_dir>/mask and <root_dir>/mask_render contain images with matching names.
   - <root_dir>/<ply_a> and <root_dir>/<ply_b> contain PLYs with matching names.
+  - Or provide two explicit files via --ply_file_a/--ply_file_b for a single pair.
   - PLYs can be point clouds or triangle meshes (meshes will be uniformly sampled).
 
 Outputs:
@@ -41,13 +44,18 @@ def load_mask(path: Path, thresh: int = 127) -> np.ndarray:
     return arr > thresh
 
 
+def _center_crop_to_min(a: np.ndarray, b: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """中心对齐后裁剪到共同最小尺寸。"""
+    Ha, Wa = a.shape[:2]; Hb, Wb = b.shape[:2]
+    H, W = min(Ha, Hb), min(Wa, Wb)
+    sa_h, sa_w = max((Ha - H) // 2, 0), max((Wa - W) // 2, 0)
+    sb_h, sb_w = max((Hb - H) // 2, 0), max((Wb - W) // 2, 0)
+    return a[sa_h:sa_h+H, sa_w:sa_w+W], b[sb_h:sb_h+H, sb_w:sb_w+W]
+
 def compute_iou(mask_a: np.ndarray, mask_b: np.ndarray) -> float:
     if mask_a.shape != mask_b.shape:
-        # center-crop to min common shape as fallback
-        H = min(mask_a.shape[0], mask_b.shape[0])
-        W = min(mask_a.shape[1], mask_b.shape[1])
-        mask_a = mask_a[:H, :W]
-        mask_b = mask_b[:H, :W]
+        # 实际做中心裁剪而非左上角切片
+        mask_a, mask_b = _center_crop_to_min(mask_a, mask_b)
     inter = np.logical_and(mask_a, mask_b).sum()
     union = np.logical_or(mask_a, mask_b).sum()
     if union == 0:
@@ -88,6 +96,10 @@ def load_ply_points(ply_path: Path, sample_points: int = 100000) -> np.ndarray:
         pcd = o3d.io.read_point_cloud(str(ply_path))
         if pcd is not None and len(pcd.points) > 0:
             pts = np.asarray(pcd.points, dtype=np.float32)
+            # 大点云随机下采样，控制 KDTree 规模
+            if pts.shape[0] > sample_points:
+                idx = np.random.choice(pts.shape[0], size=sample_points, replace=False)
+                pts = pts[idx]
             return pts
         # Fallback: try as mesh and sample
         mesh = o3d.io.read_triangle_mesh(str(ply_path))
@@ -104,6 +116,9 @@ def load_ply_points(ply_path: Path, sample_points: int = 100000) -> np.ndarray:
         # Point cloud
         if isinstance(m, tm.points.PointCloud):
             pts = np.asarray(m.vertices, dtype=np.float32)
+            if pts.shape[0] > sample_points:
+                idx = np.random.choice(pts.shape[0], size=sample_points, replace=False)
+                pts = pts[idx]
             return pts
         # Mesh
         if isinstance(m, tm.Trimesh):
@@ -125,18 +140,17 @@ def load_ply_points(ply_path: Path, sample_points: int = 100000) -> np.ndarray:
 
     # Last resort: simple ASCII PLY reader for vertex-only files
     try:
+        header_lines = 0
         with open(ply_path, 'rb') as f:
-            header = []
             while True:
                 line = f.readline()
-                header.append(line)
+                if not line:
+                    raise RuntimeError('Invalid PLY: missing end_header')
+                header_lines += 1
                 if line.strip() == b'end_header':
                     break
-            header_txt = b''.join(header).decode('utf-8', errors='ignore')
-            if 'format ascii' not in header_txt:
-                raise RuntimeError('Binary PLY without open3d/trimesh support')
-        # Load ASCII via numpy
-        data = np.loadtxt(ply_path, dtype=np.float32, comments=['ply', 'format', 'element', 'property', 'comment', 'obj_info', 'end_header'])
+        # 重新读文件并跳过 header；ASCII 校验在 np.loadtxt 失败时抛出
+        data = np.loadtxt(ply_path, dtype=np.float32, skiprows=header_lines)
         # Heuristic: first 3 columns are x,y,z
         if data.ndim == 1:
             data = data[None, :]
@@ -153,9 +167,15 @@ def chamfer_distances(pts_a: np.ndarray, pts_b: np.ndarray) -> Dict[str, float]:
         return {"chamfer_L2_cm2": float('nan'), "chamfer_L1_cm": float('nan')}
     # meters -> cm
     tree_b = cKDTree(pts_b)
-    d_a2b, _ = tree_b.query(pts_a, k=1, workers=-1)
+    try:
+        d_a2b, _ = tree_b.query(pts_a, k=1, workers=-1)
+    except TypeError:
+        d_a2b, _ = tree_b.query(pts_a, k=1)
     tree_a = cKDTree(pts_a)
-    d_b2a, _ = tree_a.query(pts_b, k=1, workers=-1)
+    try:
+        d_b2a, _ = tree_a.query(pts_b, k=1, workers=-1)
+    except TypeError:
+        d_b2a, _ = tree_a.query(pts_b, k=1)
     d_cm_a2b = d_a2b * 100.0
     d_cm_b2a = d_b2a * 100.0
     c2 = 0.5 * (np.mean(d_cm_a2b**2) + np.mean(d_cm_b2a**2))
@@ -215,6 +235,9 @@ def main():
     ap.add_argument('--mask_thresh', type=int, default=127, help='Threshold for binarizing grayscale masks')
     ap.add_argument('--ply_a', default=None, help='Subdir under root for PLY set A (e.g., GT)')
     ap.add_argument('--ply_b', default=None, help='Subdir under root or absolute path for PLY set B (e.g., Pred)')
+    # Single pair mode
+    ap.add_argument('--ply_file_a', default=None, help='Explicit path to a single PLY file A')
+    ap.add_argument('--ply_file_b', default=None, help='Explicit path to a single PLY file B')
     # Per-frame A vs single-dir B mode
     ap.add_argument('--ply_frames_root', default=None, help='Root where subfolders are named by frame numbers (e.g., 1701/1702/...)')
     ap.add_argument('--ply_frames_rel', default='dense/fuse.ply', help='Relative path inside each frame folder (default: dense/fuse.ply)')
@@ -262,6 +285,29 @@ def main():
 
     # 2) Chamfer for PLYs
     did_chamfer = False
+    # 2a) Single explicit file pair
+    if args.ply_file_a and args.ply_file_b and not did_chamfer:
+        pa = Path(args.ply_file_a)
+        pb = Path(args.ply_file_b)
+        if not pa.is_file() or not pb.is_file():
+            print(f"Explicit PLY files not found: {pa} or {pb}")
+        else:
+            try:
+                print(f"Chamfer single pair:\n  A={pa}\n  B={pb}")
+                a_pts = load_ply_points(pa, sample_points=args.sample_points)
+                b_pts = load_ply_points(pb, sample_points=args.sample_points)
+                d = chamfer_distances(a_pts, b_pts)
+                key = pa.stem + '::' + pb.stem
+                metrics.setdefault("ply_chamfer", {})[key] = d
+                metrics["ply_chamfer_summary"] = {
+                    "count": 1,
+                    "L2_cm2_mean": float(d["chamfer_L2_cm2"]),
+                    "L1_cm_mean": float(d["chamfer_L1_cm"]),
+                }
+                print(f"  L2_cm2={d['chamfer_L2_cm2']:.4f}, L1_cm={d['chamfer_L1_cm']:.4f}")
+                did_chamfer = True
+            except Exception as e:
+                print(f"Error computing Chamfer for explicit files: {e}")
     if args.ply_frames_root and args.ply_frames_range and args.ply_b:
         frames = parse_frame_range(args.ply_frames_range)
         a_root = Path(args.ply_frames_root)
