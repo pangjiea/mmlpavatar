@@ -56,6 +56,13 @@ def training(args: Config):
 
     background = torch.as_tensor(args.background).float().cuda()
 
+    save_comparison_outputs = not cfg('enable_face_loss', False)
+    comparison_dir = None
+    comparison_interval = 100
+    if save_comparison_outputs:
+        comparison_dir = path.join(args.out_dir, 'train_comparisons')
+        os.makedirs(comparison_dir, exist_ok=True)
+
     ema_vis_loss, ema_lpips_loss = 0.0, 0.0
     first_iter = 0
     progress_bar = tqdm(range(0, args.iterations), initial=first_iter, desc="TP")
@@ -93,6 +100,19 @@ def training(args: Config):
         image_gt[~mask] = bg
         image_gt[mask_boundary] = bg
         image[mask_boundary] = bg
+
+        if save_comparison_outputs and iteration % comparison_interval == 0:
+            try:
+                render_cpu = image.detach().cpu()
+                gt_cpu = image_gt.detach().cpu()
+                comparison_tensor = torch.cat([render_cpu, gt_cpu], dim=1)
+                comparison_np = torch.clamp(comparison_tensor, 0.0, 1.0).mul(255.0).byte().numpy()
+                cam_id = cam.get('cam_id', -1)
+                frame_id = cam.get('frame_id', -1)
+                cmp_name = f'iter_{iteration:06d}_cam{cam_id:02d}_frame{frame_id:06d}.png'
+                iio.imwrite(path.join(comparison_dir, cmp_name), comparison_np)
+            except Exception as e:
+                print(f"[warn] comparison image save failed at iter {iteration}: {e}")
 
         l1loss = l1_loss(image, image_gt)
         dxyzsmoothloss = dxyz_smooth_loss(gaussians) * args.lambda_dxyz_smooth

@@ -55,5 +55,5 @@ iteration_dxyz_basis: 2000
 iteration_gsparam_basis: 2000
 
 enable_face_loss : True
-lambda_face_l1 : 1.0
+lambda_face_l1 : 0.3
 face_mask_method : 'smplx'  
