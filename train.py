@@ -104,12 +104,10 @@ def training(args: Config):
 
         # Face-region losses (coarse ROI based on silhouette bbox)
         face_l1loss = torch.tensor(0.0, device=image.device)
-        face_lpipsloss = torch.tensor(0.0, device=image.device)
         face_bbox_for_debug = None
         face_mask_debug = None
         enable_face_loss = cfg('enable_face_loss', False)
         lambda_face_l1 = cfg('lambda_face_l1', 0.0)
-        lambda_face_lpips = cfg('lambda_face_lpips', 0.0)
         face_mask_method = cfg('face_mask_method', 'smplx')
         face_roi_top_frac = cfg('face_roi_top_frac', 0.15)
         face_roi_height_frac = cfg('face_roi_height_frac', 0.22)
@@ -119,7 +117,7 @@ def training(args: Config):
         face_smplx_ax_min_frac = cfg('face_smplx_ax_min_frac', 0.25)
         face_smplx_ax_max_frac = cfg('face_smplx_ax_max_frac', 2.0)
 
-        if enable_face_loss and (lambda_face_l1 > 0 or lambda_face_lpips > 0):
+        if enable_face_loss and lambda_face_l1 > 0:
             try:
                 # Build face bbox via chosen method
                 face_bbox = None
@@ -157,19 +155,6 @@ def training(args: Config):
                         diff = torch.abs(image - image_gt)
                         mask3 = mask_t.unsqueeze(-1).expand_as(diff)
                         face_l1loss = (diff[mask3].mean()) * lambda_face_l1
-                    # LPIPS strictly inside face mask: set outside to same background, then crop bbox
-                    if valid and lambda_face_lpips > 0 and iteration > args.iteration_lpips:
-                        ys, xs = torch.nonzero(mask_t, as_tuple=True)
-                        t, b = int(ys.min().item()), int(ys.max().item()) + 1
-                        l, r = int(xs.min().item()), int(xs.max().item()) + 1
-                        face_pred_hwc = image[t:b, l:r].clone()
-                        face_gt_hwc = image_gt[t:b, l:r].clone()
-                        patch_mask = mask_t[t:b, l:r].unsqueeze(-1)
-                        # background color already defined as `bg` (3,) CUDA tensor
-                        face_pred_hwc = torch.where(patch_mask, face_pred_hwc, bg[None, None, :])
-                        face_gt_hwc = torch.where(patch_mask, face_gt_hwc, bg[None, None, :])
-                        if face_pred_hwc.shape[0] > 0 and face_pred_hwc.shape[1] > 0:
-                            face_lpipsloss = lpips_loss(face_pred_hwc, face_gt_hwc) * lambda_face_lpips
                 elif face_bbox is not None:
                     # Fallback to bbox-based region
                     l, t, r, b = face_bbox
@@ -178,26 +163,25 @@ def training(args: Config):
                         face_gt = image_gt[t:b, l:r]
                         if face_pred.numel() > 0:
                             face_l1loss = l1_loss(face_pred, face_gt) * lambda_face_l1
-                    if lambda_face_lpips > 0 and iteration > args.iteration_lpips:
-                        face_pred_hwc = image[t:b, l:r]
-                        face_gt_hwc = image_gt[t:b, l:r]
-                        if face_pred_hwc.shape[0] > 0 and face_pred_hwc.shape[1] > 0:
-                            face_lpipsloss = lpips_loss(face_pred_hwc, face_gt_hwc) * lambda_face_lpips
             except Exception as e:
                 # Keep training robust if face ROI fails
                 print(f"[warn] face loss skipped: {e}")
 
         scaling_loss = args.lambda_scaling * gaussian_scaling_loss(gaussians.get_cano_scaling, args.scaling_threshold)
 
-        loss = l1loss + lpipsloss + dxyzsmoothloss + scaling_loss + face_l1loss + face_lpipsloss
+        loss = l1loss + lpipsloss + dxyzsmoothloss + scaling_loss + face_l1loss
 
         loss.backward()
 
         # log part
         ema_vis_loss = 0.4 * l1loss.item() + 0.6 * ema_vis_loss
         ema_lpips_loss = 0.4 * lpipsloss.item() + 0.6 * ema_lpips_loss
+        ema_face_loss = 0.0
+        ema_face_loss = 0.4 * face_l1loss.item() + 0.6 * ema_face_loss
         if iteration % 10 == 0:
-            progress_bar.set_postfix({'l1': f'{ema_vis_loss:.{4}f}' ,'lpips': f'{ema_lpips_loss:.{4}f}'})
+            progress_bar.set_postfix({'l1': f'{ema_vis_loss:.{4}f}' ,'lpips': f'{ema_lpips_loss:.{4}f}' ,'face': f'{ema_face_loss:.{4}f}',
+            'l1_loss': f'{l1loss.item():.{4}f}', 'lpips_loss': f'{lpipsloss.item():.{4}f}', 
+            'dxyz_smooth': f'{dxyzsmoothloss.item():.{4}f}', 'scaling': f'{scaling_loss.item():.{4}f}','face_l1': f'{face_l1loss.item():.{4}f}'})
             progress_bar.update(10)
         if iteration == args.iterations:
             progress_bar.close()
@@ -206,7 +190,7 @@ def training(args: Config):
             print(f'SH degree: {gaussians.sh_degree}')
 
         loss_dict = dict(l1_loss=l1loss, lpips_loss=lpipsloss, dxyzsmooth_loss=dxyzsmoothloss, scaling_loss=scaling_loss,
-                         face_l1=face_l1loss, face_lpips=face_lpipsloss)
+                         face_l1=face_l1loss)
         training_report(scene, gaussians, iteration, args.test_iterations, loss_dict, background)
 
         # optimizer step

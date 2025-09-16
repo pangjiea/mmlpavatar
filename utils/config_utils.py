@@ -69,7 +69,6 @@ class Config:
     # face-region loss
     enable_face_loss = True
     lambda_face_l1 = 0.0
-    lambda_face_lpips = 0.0
     face_mask_method = 'smplx'  # 'heuristic' | 'smplx' | 'detector'
     face_roi_top_frac = 0.15      # fraction from top of person bbox to start ROI
     face_roi_height_frac = 0.22   # fraction of person bbox height for ROI height
