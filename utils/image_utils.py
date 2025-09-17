@@ -31,16 +31,24 @@ def calc_bbox(mask, margin=0):
     bbox = np.array([left, top, right, down], dtype=int)
     return bbox
 
-try:
-    from nvjpeg import NvJpeg
-    nj = NvJpeg()
-except:
-    pass 
+import os
+
+_ENABLE_NVJPEG = os.environ.get("MMLP_ENABLE_NVJPEG", "0") == "1"
+nj = None
+if _ENABLE_NVJPEG:
+    try:
+        from nvjpeg import NvJpeg  # type: ignore
+        nj = NvJpeg()
+    except Exception as exc:
+        warnings.warn(f"nvjpeg disabled due to import failure: {exc}", RuntimeWarning)
+        nj = None
 
 def encode_bytes(image, image_encode_method=''):
     if image_encode_method == 'cpu':
         image_byte = cv.imencode('.jpg', image)
     elif image_encode_method == 'gpu':
+        if nj is None:
+            raise RuntimeError('nvjpeg not available; set MMLP_ENABLE_NVJPEG=1 and ensure nvjpeg installed')
         image_byte = nj.encode(image, 90)
     elif image_encode_method == 'torch':
 

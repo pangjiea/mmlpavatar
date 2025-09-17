@@ -141,6 +141,25 @@ class Scene:
         verts = np.array(mesh.vertices).astype(np.float32)
         faces = np.array(mesh.triangles).astype(np.float32)
 
+        face_vertices = None
+        face_vertex_path = path.abspath(path.join(path.dirname(__file__), '..', 'assets', 'SMPL-X__FLAME_vertex_ids.npy'))
+        print(f"[debug] face vertex path: {face_vertex_path}")
+        if path.exists(face_vertex_path):
+            try:
+                face_vertex_ids = np.load(face_vertex_path).astype(np.int64)
+                print(f"[debug] loaded vertex id array with shape {face_vertex_ids.shape} and dtype {face_vertex_ids.dtype}")
+                valid_mask = (face_vertex_ids >= 0) & (face_vertex_ids < verts.shape[0])
+                face_vertex_ids = face_vertex_ids[valid_mask]
+                if face_vertex_ids.size > 0:
+                    face_vertices = verts[face_vertex_ids]
+                    print(f"Loaded {face_vertex_ids.size} face vertices for region initialization")
+                else:
+                    print("[warn] face vertex list empty after validation")
+            except Exception as e:
+                print(f"[warn] failed to load face vertex ids from {face_vertex_path}: {e}")
+        else:
+            print(f"[warn] face vertex definition not found at {face_vertex_path}")
+
         if path.exists(xyz_path):
             xyz = np.array(fetchPly(xyz_path)[0], dtype=np.float32)
         else:
@@ -159,6 +178,8 @@ class Scene:
             all_poses=all_poses,
             xyz_ft=xyz_ft,
             xyz_vt=xyz_vt,
+            face_vertices=face_vertices,
+            data_dir=args.data_dir,
         )
 
         self.tb_writer = tb_writer

@@ -25,7 +25,7 @@ test:
   image_scaling: 1
 
 # optimization
-iterations: 800000
+iterations: 10000
 position_lr: 0.00016
 opacity_lr: 0.0005
 scaling_lr: 0.0005
@@ -54,6 +54,6 @@ num_features: 300
 iteration_dxyz_basis: 2000
 iteration_gsparam_basis: 2000
 
-enable_face_loss : True
-lambda_face_l1 : 0.3
-face_mask_method : 'smplx'  
+# enable_face_loss : True
+# lambda_face_l1 : 0.3
+# face_mask_method : 'smplx'  

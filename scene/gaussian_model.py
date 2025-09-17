@@ -49,6 +49,7 @@ from scene.mlp import MLP, vmap_mlp
 from utils.smpl_utils import smpl, interpolate_skinningfield, rigid_transform_tensor, rigid_transform_numba
 from utils.config_utils import Config
 from utils.sh_utils import RGB2SH
+from utils.general_utils import storePly
 
 class GaussianModel:
 
@@ -83,6 +84,8 @@ class GaussianModel:
         # basis property definition
         self.num_vt_basis = 15     # Control point basis number
         self.num_basis = 15        # Gaussian property basis number
+        self.num_face_basis = self.num_basis
+        self.body_pose_dim = 63
 
         self.encoder_feat_params = None
         self.encoder_feat_model_meta = None
@@ -107,12 +110,20 @@ class GaussianModel:
         self.joint_parents = torch.empty(0)
 
         self.all_poses = torch.empty(0)
-        
+
         # facial parameters
-        self.expression = torch.zeros(10, dtype=torch.float32)
-        self.jaw_pose = torch.zeros(3, dtype=torch.float32)
-        self.leye_pose = torch.zeros(3, dtype=torch.float32)
-        self.reye_pose = torch.zeros(3, dtype=torch.float32)
+        self._expression = torch.zeros(10, dtype=torch.float32)
+        self._jaw_pose = torch.zeros(3, dtype=torch.float32)
+        self._leye_pose = torch.zeros(3, dtype=torch.float32)
+        self._reye_pose = torch.zeros(3, dtype=torch.float32)
+        self.face_mlp = None
+        self.face_mlp_layers = None
+        self.face_mlp_input_dim = None
+        self.face_basis_bias = None
+        self.face_gs_indices = torch.empty(0, dtype=torch.long)
+        self.face_ft_indices = torch.empty(0, dtype=torch.long)
+        self.face_gaussian_mask = torch.empty(0, dtype=torch.bool)
+        self.face_anchor_mask = torch.empty(0, dtype=torch.bool)
 
         # cache
         self.cache_dict = {}
@@ -173,6 +184,13 @@ class GaussianModel:
 
             'encoder_feat_params': self.encoder_feat_params,
             'encoder_feat_model_meta': self.encoder_feat_model_meta,
+            'face_mlp_layers': self.face_mlp_layers,
+            'face_mlp_state': None,
+            'face_basis_bias': self.face_basis_bias,
+            'face_gs_indices': self.face_gs_indices,
+            'face_gaussian_mask': self.face_gaussian_mask,
+            'face_ft_indices': self.face_ft_indices,
+            'face_anchor_mask': self.face_anchor_mask,
 
             'dxyz_bs': self.dxyz_bs,
             'sh0_bs': self.sh0_bs,
@@ -184,6 +202,8 @@ class GaussianModel:
             'is_dxyz_bs': self.is_dxyz_bs,
             'is_gsparam_bs': self.is_gsparam_bs,
         }
+        if self.face_mlp is not None:
+            data['face_mlp_state'] = {k: v.detach().cpu() for k, v in self.face_mlp.state_dict().items()}
         return data
     
     def restore(self, data):
@@ -224,6 +244,40 @@ class GaussianModel:
 
         self.encoder_feat_params = loader('encoder_feat_params')
         self.encoder_feat_model_meta = loader('encoder_feat_model_meta')
+        self.face_mlp_layers = loader('face_mlp_layers')
+        face_mlp_state = loader('face_mlp_state')
+        if self.face_mlp_layers is not None and face_mlp_state is not None:
+            self.face_mlp = MLP(layers_size_list=self.face_mlp_layers).cuda()
+            face_mlp_state = {k: v.cuda() if hasattr(v, 'cuda') else v for k, v in face_mlp_state.items()}
+            self.face_mlp.load_state_dict(face_mlp_state)
+        else:
+            self.face_mlp = None
+        self.face_mlp_input_dim = self.face_mlp_layers[0] if self.face_mlp_layers is not None else None
+        self.face_basis_bias = loader('face_basis_bias')
+        self.face_gs_indices = loader('face_gs_indices')
+        self.face_gaussian_mask = loader('face_gaussian_mask')
+        self.face_ft_indices = loader('face_ft_indices')
+        self.face_anchor_mask = loader('face_anchor_mask')
+
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        if self.face_basis_bias is not None:
+            self.face_basis_bias = nn.Parameter(self.face_basis_bias.to(device).requires_grad_(True))
+        if self.face_gs_indices is not None:
+            self.face_gs_indices = self.face_gs_indices.to(device)
+        else:
+            self.face_gs_indices = torch.empty(0, dtype=torch.long, device=device)
+        if self.face_gaussian_mask is not None:
+            self.face_gaussian_mask = self.face_gaussian_mask.to(device)
+        else:
+            self.face_gaussian_mask = torch.empty(0, dtype=torch.bool, device=device)
+        if self.face_ft_indices is not None:
+            self.face_ft_indices = self.face_ft_indices.to(device)
+        else:
+            self.face_ft_indices = torch.empty(0, dtype=torch.long, device=device)
+        if self.face_anchor_mask is not None:
+            self.face_anchor_mask = self.face_anchor_mask.to(device)
+        else:
+            self.face_anchor_mask = torch.empty(0, dtype=torch.bool, device=device)
 
         self.dxyz_bs = loader('dxyz_bs')
         self.sh0_bs = loader('sh0_bs')
@@ -330,35 +384,36 @@ class GaussianModel:
         return covs
 
     @property
-    def get_joint_features(self):
+    def get_body_pose_features(self):
 
         if self.is_test:
             sigma_pca = 2.0
-            features = self.smpl_poses_cuda[1*3:22*3][None]
+            features = self.smpl_poses_cuda[1 * 3:22 * 3][None]
             lowdim_pose_conds = self.pca.transform(features)
             std = self.pca_std
             lowdim_pose_conds = torch.maximum(lowdim_pose_conds, -sigma_pca * std)
             lowdim_pose_conds = torch.minimum(lowdim_pose_conds, sigma_pca * std)
             body_features = self.pca.inverse_transform(lowdim_pose_conds).reshape(-1)
         else:
-            body_features = self.smpl_poses_cuda[3:3*22]  # 63维 body poses
+            body_features = self.smpl_poses_cuda[3:3 * 22]  # 63维 body poses
 
-        # 拼接表情和下颌参数
-        expression_cuda = self.expression.cuda()  # 10维
-        jaw_pose_cuda = self.jaw_pose.cuda()      # 3维
-        leye_pose_cuda = self.leye_pose.cuda()    # 3维
-        reye_pose_cuda = self.reye_pose.cuda()    # 3维
-        
-        # 组合成82维特征: body(63) + expression(10) + jaw(3) + leye_pose(3) + reye_pose(3)
-        features = torch.cat([body_features, expression_cuda, jaw_pose_cuda, leye_pose_cuda, reye_pose_cuda])
-        
-        # Debug: Print feature dimensions
-        if features.shape[0] != 82:
-            print(f"Warning: Expected 82 features, got {features.shape[0]}")
-            print(f"body_features: {body_features.shape[0]}, expression: {expression_cuda.shape[0]}, jaw_pose: {jaw_pose_cuda.shape[0]}, leye_pose: {leye_pose_cuda.shape[0]}, reye_pose: {reye_pose_cuda.shape[0]}")
-            # Truncate to 82 if needed
-            features = features[:82]
+        return body_features
 
+    @property
+    def get_face_condition_features(self):
+        device = self._xyz.device if self._xyz.numel() > 0 else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        expression_cuda = torch.as_tensor(self.expression, dtype=torch.float32, device=device)
+        jaw_pose_cuda = torch.as_tensor(self.jaw_pose, dtype=torch.float32, device=device)
+        leye_pose_cuda = torch.as_tensor(self.leye_pose, dtype=torch.float32, device=device)
+        reye_pose_cuda = torch.as_tensor(self.reye_pose, dtype=torch.float32, device=device)
+        face_features = torch.cat([expression_cuda, jaw_pose_cuda, leye_pose_cuda, reye_pose_cuda], dim=0)
+        return face_features
+
+    @property
+    def get_joint_features(self):
+        body_features = self.get_body_pose_features
+        face_features = self.get_face_condition_features
+        features = torch.cat([body_features, face_features])
         return features
 
     @torch.no_grad()
@@ -383,7 +438,7 @@ class GaussianModel:
     @property
     def get_encoded_feature(self):
         if 'get_encoded_feature' in self.cache_dict: return self.cache_dict['get_encoded_feature']
-        features = self.get_joint_features
+        features = self.get_body_pose_features
         N_feat = len(self.encoder_feat_params['layers.0.weight'])
         features = features.tile([N_feat, 1])
         features = vmap_mlp(self.encoder_feat_params, features)
@@ -397,8 +452,32 @@ class GaussianModel:
         features = self.get_encoded_feature[...,:self.num_basis]
         features = torch.einsum('nrc,nr->nc', features[self.nbr_gsft], self.nbr_gsft_wght)
 
+        if self.face_mlp is not None and self.face_gs_indices.numel() > 0:
+            face_weights = self.get_face_basis_weights
+            features = features.clone()
+            features[self.face_gs_indices] = face_weights
+
         self.cache_dict['get_encoded_feature_gsparam_weight'] = features
         return features
+
+    @property
+    def get_face_basis_weights(self):
+        if self.face_mlp is None or self.face_gs_indices.numel() == 0:
+            device = self._xyz.device if self._xyz.numel() > 0 else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            return torch.empty((0, self.num_basis), device=device)
+
+        if 'get_face_basis_weights' in self.cache_dict:
+            return self.cache_dict['get_face_basis_weights']
+
+        face_features = self.get_face_condition_features
+        face_input = face_features.unsqueeze(0)
+        weights = self.face_mlp(face_input).squeeze(0)
+        if self.face_basis_bias is not None:
+            weights = weights + self.face_basis_bias
+        weights = weights.to(self._xyz.dtype)
+        weights = weights.expand(self.face_gs_indices.shape[0], -1)
+        self.cache_dict['get_face_basis_weights'] = weights
+        return weights
 
     @property
     def get_dxyz_vt(self):
@@ -513,7 +592,82 @@ class GaussianModel:
 
         return color
 
-    def create_from_pcd(self, xyz=None, t_joints=None, joint_parents=None, all_poses=None, lbs_weights_grid_info=None, xyz_vt=None, xyz_ft=None):
+    def _initialize_face_region(self, face_vertices, xyz, xyz_ft, data_dir):
+        device = xyz.device
+        print(f"[debug] initialize_face_region: face_vertices is None? {face_vertices is None}")
+
+        if face_vertices is None or len(face_vertices) == 0:
+            self.face_gs_indices = torch.empty(0, dtype=torch.long, device=device)
+            self.face_gaussian_mask = torch.zeros(xyz.shape[0], dtype=torch.bool, device=device)
+            self.face_ft_indices = torch.empty(0, dtype=torch.long, device=device)
+            self.face_anchor_mask = torch.zeros(xyz_ft.shape[0], dtype=torch.bool, device=device) if xyz_ft is not None else torch.zeros(0, dtype=torch.bool, device=device)
+            return
+
+        face_vertices_tensor = torch.as_tensor(face_vertices, dtype=torch.float32, device=device)
+        print(f"[debug] face_vertices tensor shape {face_vertices_tensor.shape}")
+        if face_vertices_tensor.numel() == 0:
+            self.face_gs_indices = torch.empty(0, dtype=torch.long, device=device)
+            self.face_gaussian_mask = torch.zeros(xyz.shape[0], dtype=torch.bool, device=device)
+            self.face_ft_indices = torch.empty(0, dtype=torch.long, device=device)
+            self.face_anchor_mask = torch.zeros(xyz_ft.shape[0], dtype=torch.bool, device=device) if xyz_ft is not None else torch.zeros(0, dtype=torch.bool, device=device)
+            return
+
+        print(f"[debug] Running KNN for face region: xyz {xyz.shape}, xyz_ft {None if xyz_ft is None else xyz_ft.shape}")
+        _, idxs_gs, _ = knn_points(
+            p1=face_vertices_tensor[None],
+            p2=xyz[None],
+            K=1,
+        )
+        face_gs_idx = torch.unique(idxs_gs[0, :, 0])
+        face_gaussian_mask = torch.zeros(xyz.shape[0], dtype=torch.bool, device=device)
+        face_gaussian_mask[face_gs_idx] = True
+        self.face_gs_indices = face_gs_idx
+        self.face_gaussian_mask = face_gaussian_mask
+
+        if xyz_ft is not None and xyz_ft.shape[0] > 0:
+            _, idxs_ft, _ = knn_points(
+                p1=face_vertices_tensor[None],
+                p2=xyz_ft[None],
+                K=1,
+            )
+            face_ft_idx = torch.unique(idxs_ft[0, :, 0])
+            face_anchor_mask = torch.zeros(xyz_ft.shape[0], dtype=torch.bool, device=device)
+            face_anchor_mask[face_ft_idx] = True
+            self.face_ft_indices = face_ft_idx
+            self.face_anchor_mask = face_anchor_mask
+            print(f"Face anchor MLP count: {int(face_anchor_mask.sum().item())} / {xyz_ft.shape[0]}")
+            self._export_face_anchor_debug(xyz, xyz_ft, face_gaussian_mask, face_anchor_mask, data_dir)
+        else:
+            self.face_ft_indices = torch.empty(0, dtype=torch.long, device=device)
+            self.face_anchor_mask = torch.zeros(0, dtype=torch.bool, device=device)
+
+    def _export_face_anchor_debug(self, xyz, xyz_ft, face_mask, anchor_mask, data_dir):
+        if data_dir is None:
+            print('[debug] face debug export skipped: data_dir None')
+            return
+        try:
+            out_dir = os.path.join(data_dir, 'gaussian')
+            os.makedirs(out_dir, exist_ok=True)
+
+            xyz_cpu = xyz.detach().cpu().numpy()
+            print(f"[debug] exporting face debug ply to {out_dir}")
+            colors_gs = np.zeros((xyz_cpu.shape[0], 3), dtype=np.uint8)
+            colors_gs[:, 2] = 255
+            face_mask_np = face_mask.detach().cpu().numpy().astype(bool)
+            colors_gs[face_mask_np] = np.array([255, 0, 0], dtype=np.uint8)
+            storePly(os.path.join(out_dir, 'init_gaussians_face_debug.ply'), xyz_cpu, colors_gs)
+
+            if xyz_ft is not None and xyz_ft.shape[0] > 0:
+                xyz_ft_cpu = xyz_ft.detach().cpu().numpy()
+                colors_ft = np.zeros((xyz_ft_cpu.shape[0], 3), dtype=np.uint8)
+                colors_ft[:, 2] = 255
+                anchor_mask_np = anchor_mask.detach().cpu().numpy().astype(bool)
+                colors_ft[anchor_mask_np] = np.array([255, 0, 0], dtype=np.uint8)
+                storePly(os.path.join(out_dir, 'init_feature_anchors_face_debug.ply'), xyz_ft_cpu, colors_ft)
+        except Exception as e:
+            print(f"[warn] face anchor visualization failed: {e}")
+
+    def create_from_pcd(self, xyz=None, t_joints=None, joint_parents=None, all_poses=None, lbs_weights_grid_info=None, xyz_vt=None, xyz_ft=None, face_vertices=None, data_dir=None):
         xyz = torch.as_tensor(xyz).float().cuda() # [N,3]
         N = xyz.shape[0]
         print("Number of points at initialization : ", N)
@@ -549,10 +703,10 @@ class GaussianModel:
         for key in ['grid', 'bbox_min', 'bbox_max', 'grid_dims']: ginfo[key] = torch.as_tensor(ginfo[key]).detach().cuda()
         self.weights_grid_info = ginfo
 
-        # Pose encoder - 扩展输入维度支持表情: body(63) + expression(10) + jaw(3) + leye_pose(3) + reye_pose(3) = 82
-        models = [MLP(layers_size_list=[82, 512, 256, 256, 256, self.num_basis+self.num_vt_basis]) for i in range(len(xyz_ft))]
+        # Pose encoder - 仅使用身体姿态作为输入
+        models = [MLP(layers_size_list=[self.body_pose_dim, 512, 256, 256, 256, self.num_basis+self.num_vt_basis]) for i in range(len(xyz_ft))]
         params, _ = stack_module_state(models)
-        self.encoder_feat_model_meta = MLP(layers_size_list=[82, 512, 256, 256, 256, self.num_basis+self.num_vt_basis]).to('meta')
+        self.encoder_feat_model_meta = MLP(layers_size_list=[self.body_pose_dim, 512, 256, 256, 256, self.num_basis+self.num_vt_basis]).to('meta')
         for k, v in params.items():
             params[k] = nn.Parameter(v.cuda().requires_grad_(True))
         self.encoder_feat_params = params
@@ -577,6 +731,14 @@ class GaussianModel:
         xyz_ft = torch.as_tensor(xyz_ft).float().cuda()
         xyz_vt = torch.as_tensor(xyz_vt).float().cuda()
         self.dxyz_vt = nn.Parameter(torch.zeros_like(xyz_vt).float().cuda().requires_grad_(True))
+
+        self._initialize_face_region(face_vertices, self._xyz, xyz_ft, data_dir)
+
+        face_input_dim = int(self.expression.numel() + self.jaw_pose.numel() + self.leye_pose.numel() + self.reye_pose.numel())
+        self.face_mlp_input_dim = face_input_dim
+        self.face_mlp_layers = [face_input_dim, 256, 128, self.num_face_basis]
+        self.face_mlp = MLP(layers_size_list=self.face_mlp_layers).cuda()
+        self.face_basis_bias = nn.Parameter(torch.zeros(self.num_face_basis, dtype=torch.float32, device=self._xyz.device))
 
         self.prepare_interpolating_weights(xyz_ft, xyz_vt)
 
@@ -606,6 +768,10 @@ class GaussianModel:
 
             'xyz_offset': Adam([self.xyz_offset], args.xyz_offset_lr, betas, eps),
         }
+        if self.face_mlp is not None:
+            optimizers['face_mlp'] = AdamW(self.face_mlp.parameters(), args.encoder_lr, betas, eps, decay)
+        if self.face_basis_bias is not None:
+            optimizers['face_basis_bias'] = AdamW([self.face_basis_bias], args.encoder_lr, betas, eps, decay)
 
         schedulers = [
             ExponentialLR(optimizers['dxyz'], gamma=0.01 ** (1.0 / args.iterations)),
@@ -620,6 +786,10 @@ class GaussianModel:
 
             ExponentialLR(optimizers['xyz_offset'], gamma=0.1 ** (1.0 / args.iterations)),
         ]
+        if 'face_mlp' in optimizers:
+            schedulers.append(ExponentialLR(optimizers['face_mlp'], gamma=0.1 ** (1.0 / args.iterations)))
+        if 'face_basis_bias' in optimizers:
+            schedulers.append(ExponentialLR(optimizers['face_basis_bias'], gamma=0.1 ** (1.0 / args.iterations)))
 
         self.optimizers = optimizers
         self.schedulers = schedulers
@@ -678,6 +848,42 @@ class GaussianModel:
         self.cache_dict = {}
         self._smpl_poses = value.cpu()
         self.smpl_poses_cuda = value.cuda(non_blocking=True)
+
+    @property
+    def expression(self):
+        return self._expression
+
+    @expression.setter
+    def expression(self, value):
+        self.cache_dict = {}
+        self._expression = torch.as_tensor(value, dtype=torch.float32).cpu()
+
+    @property
+    def jaw_pose(self):
+        return self._jaw_pose
+
+    @jaw_pose.setter
+    def jaw_pose(self, value):
+        self.cache_dict = {}
+        self._jaw_pose = torch.as_tensor(value, dtype=torch.float32).cpu()
+
+    @property
+    def leye_pose(self):
+        return self._leye_pose
+
+    @leye_pose.setter
+    def leye_pose(self, value):
+        self.cache_dict = {}
+        self._leye_pose = torch.as_tensor(value, dtype=torch.float32).cpu()
+
+    @property
+    def reye_pose(self):
+        return self._reye_pose
+
+    @reye_pose.setter
+    def reye_pose(self, value):
+        self.cache_dict = {}
+        self._reye_pose = torch.as_tensor(value, dtype=torch.float32).cpu()
 
     @property
     def Rh(self):
