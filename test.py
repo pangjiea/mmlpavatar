@@ -95,14 +95,14 @@ def load_smpl_params_with_rhth(pose_path):
     for frame_id in range(N_frame):
         global_orient = smpl_params['global_orient'][frame_id] if 'global_orient' in smpl_params else np.zeros(3, dtype=np.float32)
         jaw_pose = smpl_params['jaw_pose'][frame_id] if 'jaw_pose' in smpl_params else np.zeros(3, dtype=np.float32)
-        expression = smpl_params['expression'][frame_id] if 'expression' in smpl_params else np.zeros(10, dtype=np.float32)
+        expression = smpl_params['expression'][frame_id] if 'expression' in smpl_params else np.zeros(EXPRESSION_DIM, dtype=np.float32)
         leye_pose = smpl_params['leye_pose'][frame_id] if 'leye_pose' in smpl_params else np.zeros(3, dtype=np.float32)
         reye_pose = smpl_params['reye_pose'][frame_id] if 'reye_pose' in smpl_params else np.zeros(3, dtype=np.float32)
         # 规范 expression 维度并保证 float32
-        if len(expression) > 10:
-            expression = expression[:10]
-        elif len(expression) < 10:
-            expression = np.pad(expression, (0, 10 - len(expression)))
+        if len(expression) > EXPRESSION_DIM:
+            expression = expression[:EXPRESSION_DIM]
+        elif len(expression) < EXPRESSION_DIM:
+            expression = np.pad(expression, (0, EXPRESSION_DIM - len(expression)))
         expression = np.asarray(expression, dtype=np.float32)
 
         pose = np.concatenate([
@@ -157,7 +157,7 @@ def testing_novel_cam_pose_speed(gaussians: GaussianModel, out_dir, frame_ids, p
         expr = pose['expression']
     else:
         print('[Info] expression 缺失, 使用零向量 (warmup frame 0)')
-        expr = torch.zeros(10, dtype=torch.float32)
+        expr = torch.zeros(EXPRESSION_DIM, dtype=torch.float32)
     gaussians.expression = torch.as_tensor(expr, dtype=torch.float32)
     gaussians.jaw_pose = gaussians.smpl_poses[66:69]
     gaussians.leye_pose = gaussians.smpl_poses[69:72]
@@ -180,7 +180,7 @@ def testing_novel_cam_pose_speed(gaussians: GaussianModel, out_dir, frame_ids, p
             expr = pose['expression']
         else:
             print(f'[Info] expression 缺失, 使用零向量 (frame {frame_id})')
-            expr = torch.zeros(10, dtype=torch.float32)
+            expr = torch.zeros(EXPRESSION_DIM, dtype=torch.float32)
         gaussians.expression = torch.as_tensor(expr, dtype=torch.float32)
         gaussians.jaw_pose = gaussians.smpl_poses[66:69]
         gaussians.leye_pose = gaussians.smpl_poses[69:72]
@@ -264,7 +264,7 @@ def testing_dataset(gaussians: GaussianModel, out_dir, dataset, background):
             expr = cam['expression'].float()
         else:
             print(f'[Info] expression 缺失, 使用零向量 (dataset frame {frame_id})')
-            expr = torch.zeros(10, dtype=torch.float32)
+            expr = torch.zeros(EXPRESSION_DIM, dtype=torch.float32)
         gaussians.expression = torch.as_tensor(expr, dtype=torch.float32)
         gaussians.jaw_pose = gaussians.smpl_poses[66:69]
         gaussians.leye_pose = gaussians.smpl_poses[69:72]
@@ -466,3 +466,4 @@ if __name__ == "__main__":
     torch.backends.cudnn.benchmark = True
 
     testing(args)
+EXPRESSION_DIM = 50

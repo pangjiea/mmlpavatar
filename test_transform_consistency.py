@@ -28,7 +28,7 @@ def test_transform_consistency():
     global_orient = torch.zeros(3)  # SQ02中global_orient为0
     transl = torch.zeros(3)  # SQ02中transl为0
     betas = torch.randn(10) * 0.1  # 身体形状
-    expression = torch.randn(10) * 0.1  # 表情
+    expression = torch.randn(50) * 0.1  # 表情
     jaw_pose = torch.randn(3) * 0.1  # 下颌
     
     # SQ02特有的真实变换参数
@@ -50,7 +50,7 @@ def test_transform_consistency():
         model_type='smplx', 
         gender='neutral',
         num_betas=10,
-        num_expression_coeffs=10,
+        num_expression_coeffs=50,
         use_pca=False,
         flat_hand_mean=True,
         ext='npz'
@@ -62,7 +62,7 @@ def test_transform_consistency():
         'body_pose': body_pose.reshape(1, -1).to(device),  # [1, 63]
         'transl': transl.unsqueeze(0).to(device),  # [1, 3]
         'betas': betas.unsqueeze(0).to(device),  # [1, 10]
-        'expression': expression.unsqueeze(0).to(device),  # [1, 10]
+        'expression': expression.unsqueeze(0).to(device),  # [1, 50]
         'jaw_pose': jaw_pose.unsqueeze(0).to(device),  # [1, 3]
     }
     

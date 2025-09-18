@@ -98,7 +98,7 @@ def dump_poses_to_json(out_path, gaussians):
             'pose': gaussians.all_poses[str(frame_id)],
             'Th': gaussians.all_Th[str(frame_id)],
             'Rh': gaussians.all_Rh[str(frame_id)],
-            'expression': gaussians.all_expression[str(frame_id)] if hasattr(gaussians, 'all_expression') and str(frame_id) in gaussians.all_expression else np.zeros(10, dtype=np.float32),                
+            'expression': gaussians.all_expression[str(frame_id)] if hasattr(gaussians, 'all_expression') and str(frame_id) in gaussians.all_expression else np.zeros(getattr(gaussians, 'expression_dim', 50), dtype=np.float32),                
         }
         data_list.append(data)
 

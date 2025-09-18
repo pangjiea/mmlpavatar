@@ -15,11 +15,14 @@ import imageio.v3 as iio
 
 stm = None
 
+EXPRESSION_DIM = 50
+CPU_TENSOR_KEYS = ['pose', 'beta', 'Rh', 'Th', 'expression']
+
 def data_to_cam(data: dict, non_blocking=True):
     img_list = ['image', 'mask', 'mask_boundary']
     tensor_list = ['K', 'w2c']
     const_list = ['height', 'width', 'frame_id', 'cam_id', 'idx']
-    cpu_list = ['pose', 'beta', 'Rh', 'Th', 'expression']
+    cpu_list = CPU_TENSOR_KEYS
     global stm
     if stm is None: stm = torch.cuda.Stream()
     for k, v in data.items():
@@ -154,18 +157,18 @@ class AVRexDataset:
             # 使用真实的SMPL参数，而不是归零
             global_orient = smpl_params['global_orient'][frame_id] if 'global_orient' in smpl_params else np.zeros(3)
             jaw_pose = smpl_params['jaw_pose'][frame_id] if 'jaw_pose' in smpl_params else np.zeros(3)
-            expression = smpl_params['expression'][frame_id] if 'expression' in smpl_params else np.zeros(10)
+            expression = smpl_params['expression'][frame_id] if 'expression' in smpl_params else np.zeros(EXPRESSION_DIM)
             
             # 6维用于左眼和右眼pose (leye_pose 3维 + reye_pose 3维)
             leye_pose = smpl_params['leye_pose'][frame_id] if 'leye_pose' in smpl_params else np.zeros(3)
             reye_pose = smpl_params['reye_pose'][frame_id] if 'reye_pose' in smpl_params else np.zeros(3)
-            expression = smpl_params['expression'][frame_id] if 'expression' in smpl_params else np.zeros(10)
-            
-            # 确保expression参数为10维
-            if len(expression) > 10:
-                expression = expression[:10]
-            elif len(expression) < 10:
-                expression = np.pad(expression, (0, 10 - len(expression)))
+            expression = smpl_params['expression'][frame_id] if 'expression' in smpl_params else np.zeros(EXPRESSION_DIM)
+
+            # 确保expression参数为EXPRESSION_DIM维
+            if len(expression) > EXPRESSION_DIM:
+                expression = expression[:EXPRESSION_DIM]
+            elif len(expression) < EXPRESSION_DIM:
+                expression = np.pad(expression, (0, EXPRESSION_DIM - len(expression)))
             
             pose = np.concatenate([
                 global_orient,                              # global_orient (3维)

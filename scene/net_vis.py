@@ -12,6 +12,8 @@ import json
 import pickle
 from scipy.spatial.transform import Rotation
 
+EXPRESSION_DIM = 50
+
 from utils.image_utils import encode_bytes
 from utils.net_utils import net_init, recv, send, is_connected
 from scene.gaussian_model import GaussianModel
@@ -35,7 +37,7 @@ def load_pose_list(file_path):
             has_expression = True
         else:
             print('expression not found in pose, using default zeros')
-            pose['expression'] = np.zeros(10, dtype=np.float32)
+            pose['expression'] = np.zeros(EXPRESSION_DIM, dtype=np.float32)
     
     if has_expression:
         print(f"✓ Successfully loaded expression parameters from {file_path}")
@@ -144,7 +146,7 @@ class Visualizer:
                 print(f"🎭 Using expression parameters: range [{expr_range[0]:.3f}, {expr_range[1]:.3f}]")
                 self._last_expression_print = data['expression'].clone()
         else:
-            gaussians.expression = torch.zeros(10, dtype=torch.float32)
+            gaussians.expression = torch.zeros(getattr(gaussians, 'expression_dim', EXPRESSION_DIM), dtype=torch.float32)
             if not hasattr(self, '_expression_warning_printed'):
                 print(f"⚠ No expression parameters received, using neutral expression")
                 self._expression_warning_printed = True
@@ -173,4 +175,3 @@ class Visualizer:
 
         send(pickle.dumps(ret_data))
         return True
-

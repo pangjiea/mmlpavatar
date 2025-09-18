@@ -9,6 +9,8 @@ import dearpygui.dearpygui as dpg
 from scipy.spatial.transform import Rotation
 import json
 
+EXPRESSION_DIM = 50
+
 from net import net_init, recv, send, is_connected, close
 from nvjpeg import NvJpeg
 nj = NvJpeg()
@@ -187,13 +189,13 @@ def load_thuman_pose_list(pose_path):
         left_hand = smpl_params['left_hand_pose'][frame_id]
         right_hand = smpl_params['right_hand_pose'][frame_id]
 
-        expression = smpl_params.get('expression', np.zeros((N,10), dtype=np.float32))[frame_id]
-        # Normalize expression to 10 dims float32
+        expression = smpl_params.get('expression', np.zeros((N,EXPRESSION_DIM), dtype=np.float32))[frame_id]
+        # Normalize expression to EXPRESSION_DIM dims float32
         expression = np.asarray(expression, dtype=np.float32)
-        if expression.shape[0] > 10:
-            expression = expression[:10]
-        elif expression.shape[0] < 10:
-            expression = np.pad(expression, (0, 10 - expression.shape[0]))
+        if expression.shape[0] > EXPRESSION_DIM:
+            expression = expression[:EXPRESSION_DIM]
+        elif expression.shape[0] < EXPRESSION_DIM:
+            expression = np.pad(expression, (0, EXPRESSION_DIM - expression.shape[0]))
 
         pose = np.concatenate([
             global_orient.astype(np.float32),
@@ -231,7 +233,7 @@ class GUI:
         self.render_type = 'image'
 
         self.pose = np.zeros(165, dtype=np.float32)
-        self.expression = np.zeros(10, dtype=np.float32)  # 新增: 表情参数
+        self.expression = np.zeros(EXPRESSION_DIM, dtype=np.float32)  # 新增: 表情参数
         self.Th = np.array([0,0,1.1], dtype=np.float32)
         self.Rh = Rotation.from_euler('x', np.pi/2).as_matrix()
 

@@ -112,7 +112,8 @@ class GaussianModel:
         self.all_poses = torch.empty(0)
 
         # facial parameters
-        self._expression = torch.zeros(10, dtype=torch.float32)
+        self.expression_dim = 50
+        self._expression = torch.zeros(self.expression_dim, dtype=torch.float32)
         self._jaw_pose = torch.zeros(3, dtype=torch.float32)
         self._leye_pose = torch.zeros(3, dtype=torch.float32)
         self._reye_pose = torch.zeros(3, dtype=torch.float32)
@@ -856,7 +857,13 @@ class GaussianModel:
     @expression.setter
     def expression(self, value):
         self.cache_dict = {}
-        self._expression = torch.as_tensor(value, dtype=torch.float32).cpu()
+        tensor = torch.as_tensor(value, dtype=torch.float32)
+        if tensor.numel() > self.expression_dim:
+            tensor = tensor[: self.expression_dim]
+        elif tensor.numel() < self.expression_dim:
+            pad = torch.zeros(self.expression_dim - tensor.numel(), dtype=torch.float32, device=tensor.device)
+            tensor = torch.cat([tensor, pad], dim=0)
+        self._expression = tensor.cpu()
 
     @property
     def jaw_pose(self):
@@ -1023,32 +1030,10 @@ class GaussianModel:
 
         # 处理不同的参数格式
         if 'pose' in smpl_data:
-            # 格式1: 直接包含完整pose参数
-            poses = smpl_data['pose']
-            # 检查pose参数的维度，如果是165维（旧格式），需要扩展以包含jaw_pose和expression
-            if poses.shape[1] == 165:
-                # 旧格式: [global_orient(3) + body_pose(63) + jaw_pose(3) + padding(6) + hands(90)]
-                # 新格式: [global_orient(3) + body_pose(63) + jaw_pose(3) + expression(10) + hands(90)]
-                new_poses = []
-                for i in range(len(poses)):
-                    pose = poses[i]
-                    # 提取各部分
-                    global_orient = pose[0:3]
-                    body_pose = pose[3:66]
-                    jaw_pose = pose[66:69]
-                    # padding = pose[69:75]  # 6维填充，丢弃
-                    left_hand_pose = pose[75:120]
-                    right_hand_pose = pose[120:165]
-                    # 使用默认expression（10维）
-                    expression = np.zeros(10, dtype=np.float32)
-                    
-                    # 重新组合为新格式
-                    new_pose = np.concatenate([
-                        global_orient, body_pose, jaw_pose, expression, 
-                        left_hand_pose, right_hand_pose
-                    ], axis=0)
-                    new_poses.append(new_pose)
-                poses = np.array(new_poses)
+            poses = np.asarray(smpl_data['pose'])
+            if poses.shape[1] < 165:
+                raise ValueError(f"SMPL pose dimension too small: {poses.shape[1]}")
+            poses = poses[:, :165]
         elif 'global_orient' in smpl_data and 'body_pose' in smpl_data:
             # 格式2: 分离的参数，需要组合
             global_orient = smpl_data['global_orient']
@@ -1056,23 +1041,18 @@ class GaussianModel:
             left_hand_pose = smpl_data.get('left_hand_pose', np.zeros((len(global_orient), 45)))
             right_hand_pose = smpl_data.get('right_hand_pose', np.zeros((len(global_orient), 45)))
             jaw_pose = smpl_data.get('jaw_pose', np.zeros((len(global_orient), 3)))
-            expression = smpl_data.get('expression', np.zeros((len(global_orient), 10)))
+            leye_pose = smpl_data.get('leye_pose', np.zeros((len(global_orient), 3)))
+            reye_pose = smpl_data.get('reye_pose', np.zeros((len(global_orient), 3)))
 
-            # 组合为完整pose参数 [global_orient(3) + body_pose(63) + jaw_pose(3) + expression(10) + hands(90)] = 169维
+            # 组合为完整pose参数 [global_orient(3) + body_pose(63) + jaw_pose(3) + leye_pose(3) + reye_pose(3) + hands(90)]
             poses = []
             for i in range(len(global_orient)):
-                # 确保expression参数只使用前10维
-                expr = expression[i]
-                if len(expr) > 10:
-                    expr = expr[:10]
-                elif len(expr) < 10:
-                    expr = np.pad(expr, (0, 10 - len(expr)))
-                
                 pose = np.concatenate([
                     global_orient[i],           # 3维全局旋转
                     body_pose[i],              # 63维身体姿态
                     jaw_pose[i],               # 3维下颌姿态
-                    expr,                      # 10维表情参数
+                    leye_pose[i],              # 3维左眼姿态
+                    reye_pose[i],              # 3维右眼姿态
                     left_hand_pose[i],         # 45维左手姿态
                     right_hand_pose[i],        # 45维右手姿态
                 ], axis=0)
@@ -1087,7 +1067,9 @@ class GaussianModel:
         # 表情参数
         expressions = smpl_data.get('expression', None)
         if expressions is not None:
-            expressions = expressions[:, :10]  # 使用前10维
+            expressions = expressions[:, :self.expression_dim]
+        else:
+            expressions = np.zeros((len(poses), self.expression_dim), dtype=np.float32)
 
         # 下颌参数
         jaw_poses = smpl_data.get('jaw_pose', None)
@@ -1101,13 +1083,13 @@ class GaussianModel:
         self.Rh = torch.eye(3, dtype=torch.float32)  # 使用单位矩阵
 
         if expression is not None:
-            # 确保expression是10维的
+            # 确保expression是self.expression_dim维的
             expr_tensor = torch.from_numpy(expression).float()
-            if expr_tensor.shape[0] > 10:
-                expr_tensor = expr_tensor[:10]
-            elif expr_tensor.shape[0] < 10:
-                # 如果不足10维，用0填充
-                padding = torch.zeros(10 - expr_tensor.shape[0], dtype=torch.float32)
+            if expr_tensor.shape[0] > self.expression_dim:
+                expr_tensor = expr_tensor[:self.expression_dim]
+            elif expr_tensor.shape[0] < self.expression_dim:
+                # 如果不足表达维度，用0填充
+                padding = torch.zeros(self.expression_dim - expr_tensor.shape[0], dtype=torch.float32)
                 expr_tensor = torch.cat([expr_tensor, padding])
             self.expression = expr_tensor
         if jaw_pose is not None:

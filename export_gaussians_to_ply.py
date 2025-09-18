@@ -233,11 +233,11 @@ def export_sequence(model_dir: str, npz_path: str, output_dir: str,
         # Facial parameters
         if exp_key is not None:
             exp_np = np.asarray(motion[exp_key][idx], dtype=np.float32).reshape(-1)
-            # Normalize to 10 dims to match training/config
-            if exp_np.shape[0] > 10:
-                exp_np = exp_np[:10]
-            elif exp_np.shape[0] < 10:
-                exp_np = np.pad(exp_np, (0, 10 - exp_np.shape[0]))
+            expr_dim = getattr(gaussians, 'expression_dim', exp_np.shape[0])
+            if exp_np.shape[0] > expr_dim:
+                exp_np = exp_np[:expr_dim]
+            elif exp_np.shape[0] < expr_dim:
+                exp_np = np.pad(exp_np, (0, expr_dim - exp_np.shape[0]))
             gaussians.expression = torch.from_numpy(exp_np).float()
         if jaw_key is not None:
             jaw_np = np.asarray(motion[jaw_key][idx], dtype=np.float32).reshape(-1)

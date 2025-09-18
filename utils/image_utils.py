@@ -13,6 +13,8 @@ from utils.smpl_utils import smpl
 import torch
 import numpy as np
 
+EXPRESSION_DIM = 50
+
 def calc_bbox(mask, margin=0):
     # [left right)  [top down)
     height, width = mask.shape
@@ -200,12 +202,12 @@ def calc_face_bbox_smplx(pose_vec: torch.Tensor,
         body_pose = pose_vec[3:66].detach().cpu().unsqueeze(0)  # [1,63]
         betas = beta_vec.detach().cpu().unsqueeze(0)  # [1,10]
         jaw_pose = jaw_pose_vec.detach().cpu().unsqueeze(0)  # [1,3]
-        # Expression may be >10, clamp to 10
+        # Expression may be >EXPRESSION_DIM, clamp accordingly
         expr = expression_vec.detach().cpu()
-        if expr.numel() > 10:
-            expr = expr[:10]
-        elif expr.numel() < 10:
-            expr = torch.nn.functional.pad(expr, (0, 10 - expr.numel()))
+        if expr.numel() > EXPRESSION_DIM:
+            expr = expr[:EXPRESSION_DIM]
+        elif expr.numel() < EXPRESSION_DIM:
+            expr = torch.nn.functional.pad(expr, (0, EXPRESSION_DIM - expr.numel()))
         expr = expr.unsqueeze(0)
 
         smpl_out = smpl.model(
@@ -306,10 +308,10 @@ def calc_face_mask_smplx(pose_vec: torch.Tensor,
         betas = beta_vec.detach().cpu().unsqueeze(0)  # [1,10]
         jaw_pose = jaw_pose_vec.detach().cpu().unsqueeze(0)  # [1,3]
         expr = expression_vec.detach().cpu()
-        if expr.numel() > 10:
-            expr = expr[:10]
-        elif expr.numel() < 10:
-            expr = torch.nn.functional.pad(expr, (0, 10 - expr.numel()))
+        if expr.numel() > EXPRESSION_DIM:
+            expr = expr[:EXPRESSION_DIM]
+        elif expr.numel() < EXPRESSION_DIM:
+            expr = torch.nn.functional.pad(expr, (0, EXPRESSION_DIM - expr.numel()))
         expr = expr.unsqueeze(0)
 
         smpl_out = smpl.model(
