@@ -7,6 +7,8 @@ import torch
 
 def rand_point_on_mesh(vert, face, pts_num=7000, init_factor=5):
     import open3d as o3d
+    if pts_num <= 0:
+        return np.empty((0, 3), dtype=np.float32)
     mesh = o3d.geometry.TriangleMesh()
     mesh.vertices = o3d.utility.Vector3dVector(vert)
     mesh.triangles = o3d.utility.Vector3iVector(face)

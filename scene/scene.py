@@ -139,9 +139,10 @@ class Scene:
 
         mesh = o3d.io.read_triangle_mesh(path.join(args.data_dir, 'gaussian/template.ply'))
         verts = np.array(mesh.vertices).astype(np.float32)
-        faces = np.array(mesh.triangles).astype(np.float32)
+        faces = np.array(mesh.triangles).astype(np.int32)
 
         face_vertices = None
+        face_vertex_ids = None
         face_vertex_path = path.abspath(path.join(path.dirname(__file__), '..', 'assets', 'SMPL-X__FLAME_vertex_ids.npy'))
         print(f"[debug] face vertex path: {face_vertex_path}")
         if path.exists(face_vertex_path):
@@ -167,8 +168,40 @@ class Scene:
             xyz = rand_point_on_mesh(verts, faces, pts_num=args.init_num_gs)
             storePly(xyz_path, xyz, np.zeros_like(xyz))
 
-        xyz_ft = rand_point_on_mesh(verts, faces, pts_num=args.num_features, init_factor=7)
-        xyz_vt = rand_point_on_mesh(verts, faces, pts_num=args.num_verts, init_factor=7)
+        def sample_face_points(num_points, init_factor=5):
+            if face_vertex_ids is None or num_points <= 0:
+                return np.empty((0, 3), dtype=np.float32)
+            face_mask = np.all(np.isin(faces, face_vertex_ids), axis=1)
+            face_faces = faces[face_mask]
+            if face_faces.shape[0] == 0:
+                return np.empty((0, 3), dtype=np.float32)
+            return rand_point_on_mesh(verts, face_faces, pts_num=num_points, init_factor=init_factor)
+
+        def sample_body_points(num_points, init_factor=7):
+            if num_points <= 0:
+                return np.empty((0, 3), dtype=np.float32)
+            return rand_point_on_mesh(verts, faces, pts_num=num_points, init_factor=init_factor)
+
+        face_feature_target = args.num_features // 2
+        body_feature_target = args.num_features - face_feature_target
+        xyz_ft_body = sample_body_points(body_feature_target, init_factor=7)
+        xyz_ft_face = sample_face_points(face_feature_target, init_factor=4)
+        if xyz_ft_face.shape[0] < face_feature_target:
+            needed = face_feature_target - xyz_ft_face.shape[0]
+            xyz_ft_face = np.concatenate([xyz_ft_face, sample_body_points(needed, init_factor=7)], axis=0) if xyz_ft_face.size else sample_body_points(face_feature_target, init_factor=7)
+        xyz_ft = np.concatenate([xyz_ft_body, xyz_ft_face], axis=0)
+
+        face_vert_target = args.num_verts // 2
+        body_vert_target = args.num_verts - face_vert_target
+        xyz_vt_body = sample_body_points(body_vert_target, init_factor=7)
+        xyz_vt_face = sample_face_points(face_vert_target, init_factor=4)
+        if xyz_vt_face.shape[0] < face_vert_target:
+            needed = face_vert_target - xyz_vt_face.shape[0]
+            xyz_vt_face = np.concatenate([xyz_vt_face, sample_body_points(needed, init_factor=7)], axis=0) if xyz_vt_face.size else sample_body_points(face_vert_target, init_factor=7)
+        xyz_vt = np.concatenate([xyz_vt_body, xyz_vt_face], axis=0)
+
+        print(f"[info] face feature anchors: {xyz_ft_face.shape[0]} / {xyz_ft.shape[0]} total")
+        print(f"[info] face control points: {xyz_vt_face.shape[0]} / {xyz_vt.shape[0]} total")
 
         gaussians.create_from_pcd(
             xyz=xyz,
