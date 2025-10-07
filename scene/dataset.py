@@ -15,11 +15,14 @@ import imageio.v3 as iio
 
 stm = None
 
+EXPRESSION_DIM = 50
+CPU_TENSOR_KEYS = ['pose', 'beta', 'Rh', 'Th', 'expression']
+
 def data_to_cam(data: dict, non_blocking=True):
     img_list = ['image', 'mask', 'mask_boundary']
     tensor_list = ['K', 'w2c']
     const_list = ['height', 'width', 'frame_id', 'cam_id', 'idx']
-    cpu_list = ['pose', 'beta', 'Rh', 'Th']
+    cpu_list = CPU_TENSOR_KEYS
     global stm
     if stm is None: stm = torch.cuda.Stream()
     for k, v in data.items():
@@ -37,10 +40,11 @@ def data_to_cam(data: dict, non_blocking=True):
     return data
 
 def get_dataset_type(datadir):
-    if path.exists(path.join(datadir, 'calibration.json')):
-        return ThumanDataset
+
     if path.exists(path.join(datadir, 'calibration_full.json')):
         return AVRexDataset
+    if path.exists(path.join(datadir, 'calibration.json')):
+        return ThumanDataset
     if path.exists(path.join(datadir, 'calibration.csv')):
         return ActorsHQDataset
     raise RuntimeError
@@ -65,7 +69,7 @@ def resize_image(image, mask, K, image_scaling=1):
 
     H, W = int(image.shape[0] * image_scaling), int(image.shape[1] * image_scaling)
     image = cv.resize(image, (W, H), interpolation=cv.INTER_AREA)
-    msk = cv.resize(msk, (W, H), interpolation=cv.INTER_NEAREST)
+    mask = cv.resize(mask, (W, H), interpolation=cv.INTER_NEAREST)
     K = np.copy(K)
     K[:2] = K[:2] * image_scaling
 
@@ -87,9 +91,10 @@ class AVRexDataset:
 
         for frame_id in frame_ids:
             for cam_id in cam_ids:
-                cam_name, img_name = annots[cam_id]['name'], f'{frame_id:08d}.jpg'
-                if path.exists(path.join(datadir, f'{cam_name}/{img_name}')) and \
-                        path.exists(path.join(datadir, f'{cam_name}/mask/pha/{img_name}')): 
+                cam_name, img_name = annots[cam_id]['name'], f'{frame_id:06d}.jpg'
+                mask_name = f'{frame_id:06d}.png'
+                if path.exists(path.join(datadir, f'images/{cam_name}/{img_name}')) and \
+                        path.exists(path.join(datadir, f'images/{cam_name}/mask/pha/{mask_name}')): 
                     indices.append( (frame_id, cam_id) )
 
         self.indices = indices
@@ -117,17 +122,46 @@ class AVRexDataset:
             data = json.load(file)
 
         cams = []
-        for k, v in data.items():
-            cam = {}
-            cam['name'] = k
-            cam['K'] = np.array(v['K']).astype(np.float32).reshape(3,3)
-            cam['R'] = np.array(v['R']).astype(np.float32).reshape(3,3)
-            cam['T'] = np.array(v['T']).astype(np.float32)
-            cam['D'] = np.array(v['distCoeff']).astype(np.float32)
-            T, R = cam['T'] , cam['R']
-            w2c = np.block([[R, T[:,None]],[0,0,0,1]])
-            cam['w2c'] = w2c
-            cams.append(cam)
+        # Support two formats:
+        # 1) Flat per-camera dict with keys K, R, T, distCoeff (calibration_full.json style)
+        # 2) Nested dict {"cameras": {...}, "camera_poses": {...}} with K (3x3) and dist (SC_01 style)
+        if isinstance(data, dict) and 'cameras' in data and 'camera_poses' in data:
+            cameras = data['cameras']
+            poses = data['camera_poses']
+            for k, v in cameras.items():
+                if k not in poses: 
+                    continue
+                cam = {}
+                cam['name'] = k
+                K = np.array(v['K']).astype(np.float32)
+                if K.size == 9:
+                    K = K.reshape(3,3)
+                cam['K'] = K
+                # Distortion may be named 'dist' here
+                D = np.array(v.get('distCoeff', v.get('dist', np.zeros(5)))).astype(np.float32)
+                cam['D'] = D
+                Rm = np.array(poses[k]['R']).astype(np.float32)
+                if Rm.size == 9:
+                    Rm = Rm.reshape(3,3)
+                cam['R'] = Rm
+                Tm = np.array(poses[k]['T']).astype(np.float32)
+                Tm = Tm.squeeze().reshape(3)
+                cam['T'] = Tm
+                w2c = np.block([[Rm, Tm[:,None]],[0,0,0,1]])
+                cam['w2c'] = w2c
+                cams.append(cam)
+        else:
+            for k, v in data.items():
+                cam = {}
+                cam['name'] = k
+                cam['K'] = np.array(v['K']).astype(np.float32).reshape(3,3)
+                cam['R'] = np.array(v['R']).astype(np.float32).reshape(3,3)
+                cam['T'] = np.array(v['T']).astype(np.float32)
+                cam['D'] = np.array(v.get('distCoeff', v.get('dist', np.zeros(5)))).astype(np.float32)
+                T, R = cam['T'] , cam['R']
+                w2c = np.block([[R, T[:,None]],[0,0,0,1]])
+                cam['w2c'] = w2c
+                cams.append(cam)
         return cams
 
     @staticmethod
@@ -135,26 +169,78 @@ class AVRexDataset:
         smpl_params = np.load(path.join(datadir, 'smpl_params.npz'), allow_pickle=True)
         smpl_params = dict(smpl_params)
 
-        N_frame = len(smpl_params['global_orient'])
-        beta = smpl_params['betas'][0]
+        # 支持不同的数据集格式
+        if 'Rh' in smpl_params:
+            N_frame = len(smpl_params['Rh'])
+        elif 'Th' in smpl_params:
+            N_frame = len(smpl_params['Th'])
+        elif 'global_orient' in smpl_params:
+            N_frame = len(smpl_params['global_orient'])
+        else:
+            raise ValueError("无法确定帧数，SMPL参数文件中缺少Rh、Th或global_orient")
+        
+        beta = smpl_params['betas'][0][:10]  # Only use first 10 shape parameters for SMPL-X
 
-        pose_list, Th_list, Rh_list = [], [], []
+        pose_list, Th_list, Rh_list, expression_list = [], [], [], []
         for frame_id in range(N_frame):
-            pose = np.concatenate([smpl_params['global_orient'][frame_id],
-                        smpl_params['body_pose'][frame_id],
-                        torch.zeros(3).float(),
-                        torch.zeros(6).float(),
-                        smpl_params['left_hand_pose'][frame_id],
-                        smpl_params['right_hand_pose'][frame_id],], axis=0)
-            Th = smpl_params['transl'][frame_id]
-            Rh = np.eye(3, dtype=np.float32)
+            # 使用真实的SMPL参数，而不是归零
+            global_orient = smpl_params['global_orient'][frame_id] if 'global_orient' in smpl_params else np.zeros(3)
+            jaw_pose = smpl_params['jaw_pose'][frame_id] if 'jaw_pose' in smpl_params else np.zeros(3)
+            expression = smpl_params['expression'][frame_id] if 'expression' in smpl_params else np.zeros(EXPRESSION_DIM)
+            
+            # 6维用于左眼和右眼pose (leye_pose 3维 + reye_pose 3维)
+            leye_pose = smpl_params['leye_pose'][frame_id] if 'leye_pose' in smpl_params else np.zeros(3)
+            reye_pose = smpl_params['reye_pose'][frame_id] if 'reye_pose' in smpl_params else np.zeros(3)
+            expression = smpl_params['expression'][frame_id] if 'expression' in smpl_params else np.zeros(EXPRESSION_DIM)
+
+            # 确保expression参数为EXPRESSION_DIM维
+            if len(expression) > EXPRESSION_DIM:
+                expression = expression[:EXPRESSION_DIM]
+            elif len(expression) < EXPRESSION_DIM:
+                expression = np.pad(expression, (0, EXPRESSION_DIM - len(expression)))
+            
+            pose = np.concatenate([
+                global_orient,                              # global_orient (3维)
+                smpl_params['body_pose'][frame_id],        # body_pose (63维)
+                jaw_pose,                                   # jaw_pose (3维)
+                leye_pose,                                  # leye_pose (3维)
+                reye_pose,                                  # reye_pose (3维)
+                smpl_params['left_hand_pose'][frame_id],   # left_hand_pose (45维)
+                smpl_params['right_hand_pose'][frame_id],  # right_hand_pose (45维)
+            ], axis=0)
+            
+            # 处理不同的全局变换参数格式
+            if 'Th' in smpl_params:
+                Th = smpl_params['Th'][frame_id]
+            else:
+                Th = smpl_params['transl'][frame_id]
+
+            # Support Rh as either rotation matrix (3x3) or rotvec (3,)
+            Rh = None
+            if 'Rh' in smpl_params:
+                Rh_raw = smpl_params['Rh'][frame_id]
+                Rh_raw = np.array(Rh_raw, dtype=np.float32)
+                if Rh_raw.shape == (3, 3):
+                    Rh = Rh_raw
+                elif Rh_raw.shape[-1] == 3 and Rh_raw.ndim == 1:
+                    # axis-angle / rotvec → rotation matrix
+                    try:
+                        Rh = Rotation.from_rotvec(Rh_raw).as_matrix().astype(np.float32)
+                    except Exception:
+                        Rh = np.eye(3, dtype=np.float32)
+                else:
+                    Rh = np.eye(3, dtype=np.float32)
+            else:
+                Rh = np.eye(3, dtype=np.float32)
 
             pose_list.append(pose)
             Th_list.append(Th)
             Rh_list.append(Rh)
+            expression_list.append(expression)
 
         pose_data = dict(pose=np.array(pose_list).astype(np.float32), Th=np.array(Th_list).astype(np.float32),
-                         Rh=np.array(Rh_list).astype(np.float32), beta=beta.astype(np.float32))
+                         Rh=np.array(Rh_list).astype(np.float32), beta=beta.astype(np.float32), 
+                         expression=np.array(expression_list).astype(np.float32))
         return pose_data
 
     @staticmethod
@@ -164,9 +250,9 @@ class AVRexDataset:
     
     @staticmethod
     def load_image_mask(datadir, cam_name, frame_id):
-        image_path = path.join(datadir, f'{cam_name}/{frame_id:08d}.jpg')
+        image_path = path.join(datadir, f'images/{cam_name}/{frame_id:06d}.jpg')
         image = iio.imread(image_path)[...,:3]
-        mask_path = path.join(datadir, f'{cam_name}/mask/pha/{frame_id:08d}.jpg')
+        mask_path = path.join(datadir, f'images/{cam_name}/mask/pha/{frame_id:06d}.png')
         mask = iio.imread(mask_path)   # 1C u8
         return image, mask
 
@@ -178,8 +264,8 @@ class AVRexDataset:
 
         frame_id, cam_id = self.indices[idx]
 
-        pose, Rh, Th, beta = self.smpl_params['pose'][frame_id], self.smpl_params['Rh'][frame_id], \
-            self.smpl_params['Th'][frame_id], self.smpl_params['beta']
+        pose, Rh, Th, beta, expression = self.smpl_params['pose'][frame_id], self.smpl_params['Rh'][frame_id], \
+            self.smpl_params['Th'][frame_id], self.smpl_params['beta'], self.smpl_params['expression'][frame_id]
 
         # Load camera
         K, D, w2c = self.annots[cam_id]['K'], self.annots[cam_id]['D'], self.annots[cam_id]['w2c']
@@ -211,6 +297,7 @@ class AVRexDataset:
             'Rh': torch.from_numpy(Rh).float(),
             'Th': torch.from_numpy(Th).float(),
             'beta': torch.from_numpy(beta).float(),
+            'expression': torch.from_numpy(expression).float(),
             'height': image.shape[0],
             'width': image.shape[1],
             'frame_id': frame_id,
@@ -227,11 +314,32 @@ class ThumanDataset:
         indices = []
         annots = AVRexDataset.load_cams_data(datadir, cam_file_name='calibration.json')
         
+        def has_image_mask_pair(datadir, cam_name, frame_id):
+            six = f'{frame_id:06d}'
+            eight = f'{frame_id:08d}'
+            # candidate image paths
+            image_cands = [
+                path.join(datadir, f'images/{cam_name}/{six}.jpg'),
+                path.join(datadir, f'images/{cam_name}/{eight}.jpg'),
+            ]
+            # candidate mask paths (several conventions)
+            mask_cands = [
+                path.join(datadir, f'images/{cam_name}/mask/pha/{six}.png'),
+                path.join(datadir, f'images/{cam_name}/mask/pha/{eight}.png'),
+                path.join(datadir, f'mattings/{cam_name}/{six}.png'),
+                path.join(datadir, f'mattings/{cam_name}/{eight}.png'),
+                path.join(datadir, f'masks/{cam_name}/{six}.jpg'),
+                path.join(datadir, f'masks/{cam_name}/{eight}.jpg'),
+            ]
+            image_path = next((p for p in image_cands if path.exists(p)), None)
+            if image_path is None: return False
+            mask_path = next((p for p in mask_cands if path.exists(p)), None)
+            return mask_path is not None
+
         for frame_id in frame_ids:
             for cam_id in cam_ids:
-                cam_name, img_name = annots[cam_id]['name'], f'{frame_id:08d}.jpg'
-                if path.exists(path.join(datadir, f'images/{cam_name}/{img_name}')) and \
-                        path.exists(path.join(datadir, f'masks/{cam_name}/{img_name}')): 
+                cam_name = annots[cam_id]['name']
+                if has_image_mask_pair(datadir, cam_name, frame_id):
                     indices.append( (frame_id, cam_id) )
 
         self.indices = indices
@@ -261,10 +369,26 @@ class ThumanDataset:
 
     @staticmethod
     def load_image_mask(datadir, cam_name, frame_id):
-        image_path = path.join(datadir, f'images/{cam_name}/{frame_id:08d}.jpg')
+        six = f'{frame_id:06d}'
+        eight = f'{frame_id:08d}'
+        image_cands = [
+            path.join(datadir, f'images/{cam_name}/{six}.jpg'),
+            path.join(datadir, f'images/{cam_name}/{eight}.jpg'),
+        ]
+        mask_cands = [
+            path.join(datadir, f'images/{cam_name}/mask/pha/{six}.png'),
+            path.join(datadir, f'images/{cam_name}/mask/pha/{eight}.png'),
+            path.join(datadir, f'mattings/{cam_name}/{six}.png'),
+            path.join(datadir, f'mattings/{cam_name}/{eight}.png'),
+            path.join(datadir, f'masks/{cam_name}/{six}.jpg'),
+            path.join(datadir, f'masks/{cam_name}/{eight}.jpg'),
+        ]
+        image_path = next((p for p in image_cands if path.exists(p)), None)
+        mask_path = next((p for p in mask_cands if path.exists(p)), None)
+        if image_path is None or mask_path is None:
+            raise FileNotFoundError('Image/mask not found for frame %s cam %s' % (frame_id, cam_name))
         image = iio.imread(image_path)[...,:3]
-        mask_path = path.join(datadir, f'masks/{cam_name}/{frame_id:08d}.jpg')
-        mask = iio.imread(mask_path)   # 1C u8
+        mask = iio.imread(mask_path)
         return image, mask
 
     def __len__(self):
@@ -275,8 +399,8 @@ class ThumanDataset:
 
         frame_id, cam_id = self.indices[idx]
 
-        pose, Rh, Th, beta = self.smpl_params['pose'][frame_id], self.smpl_params['Rh'][frame_id], \
-            self.smpl_params['Th'][frame_id], self.smpl_params['beta']
+        pose, Rh, Th, beta, expression = self.smpl_params['pose'][frame_id], self.smpl_params['Rh'][frame_id], \
+            self.smpl_params['Th'][frame_id], self.smpl_params['beta'], self.smpl_params['expression'][frame_id]
 
         # Load camera
         K, D, w2c = self.annots[cam_id]['K'], self.annots[cam_id]['D'], self.annots[cam_id]['w2c']
@@ -308,6 +432,7 @@ class ThumanDataset:
             'Rh': torch.from_numpy(Rh).float(),
             'Th': torch.from_numpy(Th).float(),
             'beta': torch.from_numpy(beta).float(),
+            'expression': torch.from_numpy(expression).float(),
             'height': image.shape[0],
             'width': image.shape[1],
             'frame_id': frame_id,
@@ -418,8 +543,8 @@ class ActorsHQDataset:
 
         frame_id, cam_id = self.indices[idx]
 
-        pose, Rh, Th, beta = self.smpl_params['pose'][frame_id], self.smpl_params['Rh'][frame_id], \
-            self.smpl_params['Th'][frame_id], self.smpl_params['beta']
+        pose, Rh, Th, beta, expression = self.smpl_params['pose'][frame_id], self.smpl_params['Rh'][frame_id], \
+            self.smpl_params['Th'][frame_id], self.smpl_params['beta'], self.smpl_params['expression'][frame_id]
 
         # Load camera
         K, D, w2c = self.annots[cam_id]['K'], self.annots[cam_id]['D'], self.annots[cam_id]['w2c']
@@ -449,6 +574,7 @@ class ActorsHQDataset:
             'Rh': torch.from_numpy(Rh).float(),
             'Th': torch.from_numpy(Th).float(),
             'beta': torch.from_numpy(beta).float(),
+            'expression': torch.from_numpy(expression).float(),
             'height': image.shape[0],
             'width': image.shape[1],
             'frame_id': frame_id,

@@ -31,7 +31,7 @@ def lpips_loss(img1, img2):
     img1 = img1.permute(2,0,1)[None]
     img2 = img2.permute(2,0,1)[None]
     if lpips_model is None: 
-        lpips_model = LearnedPerceptualImagePatchSimilarity(net_type='vgg', normalize=True).cuda()
+        lpips_model = LearnedPerceptualImagePatchSimilarity(net_type='alex', normalize=True).cuda()
         for p in lpips_model.parameters(): p.requires_grad = False
     loss = lpips_model(img1, img2)
     return loss

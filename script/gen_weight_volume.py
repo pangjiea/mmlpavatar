@@ -87,8 +87,22 @@ config = Config()
 def calc_cano_weight_volume(data_dir, pkl_path, gender = 'neutral'):
     if 'SMPLX' in pkl_path:
         smpl_params = np.load(path.join(data_dir, 'smpl_params.npz'), allow_pickle=True)
-        smpl_shape = torch.as_tensor(smpl_params['betas'][0])
         smpl_model = smplx.SMPLX(model_path=pkl_path, use_pca=False, num_pca_comps=45, flat_hand_mean=True, batch_size=1)
+        
+        # Ensure beta parameters match the model's expected dimensions
+        raw_betas = smpl_params['betas'][0]
+        expected_beta_dim = smpl_model.num_betas
+        
+        if len(raw_betas) > expected_beta_dim:
+            # Truncate if too many parameters
+            smpl_shape = torch.as_tensor(raw_betas[:expected_beta_dim])
+        elif len(raw_betas) < expected_beta_dim:
+            # Pad with zeros if too few parameters
+            padded_betas = np.zeros(expected_beta_dim, dtype=raw_betas.dtype)
+            padded_betas[:len(raw_betas)] = raw_betas
+            smpl_shape = torch.as_tensor(padded_betas)
+        else:
+            smpl_shape = torch.as_tensor(raw_betas)
     else:
         raise NotImplementedError
 
@@ -124,8 +138,8 @@ def calc_cano_weight_volume(data_dir, pkl_path, gender = 'neutral'):
     )
 
     compute_lbs_grad(cano_smpl_trimesh, smpl_model.lbs_weights.cpu().numpy())
-    solve(smpl_model.lbs_weights.shape[-1], "./PointInterpolant")
-
+    #solve(smpl_model.lbs_weights.shape[-1], "./PointInterpolant")
+    solve(smpl_model.lbs_weights.shape[-1], "../bins/PointInterpolant")
     ### NOTE concatenate all grids
     fn_list = sorted(list(glob.glob(os.path.join(tmp_dir, 'grid_*.grd'))))
 

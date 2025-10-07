@@ -93,7 +93,12 @@ class Scene:
         os.makedirs(path.join(args.data_dir, 'gaussian'), exist_ok=True)
         weights_grid_path = path.join(args.data_dir, 'gaussian/lbs_weights_grid.npz')
         if not path.exists(weights_grid_path):
-            raise FileExistsError
+            raise FileNotFoundError(
+                f"Missing LBS weights grid: {weights_grid_path}. "
+                f"Generate it before training by running: \n"
+                f"  cd script && python gen_weight_volume.py --data_dir {args.data_dir} --smpl_path {args.smpl_pkl_path}\n"
+                f"Ensure the 'PointInterpolant' binary is compiled as described in README (AnimatableGaussians preprocessing)."
+            )
         grid_info = dict(np.load(weights_grid_path, allow_pickle=True))
 
         # initialize gaussian model
